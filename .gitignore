@@ -88,3 +88,4 @@ frontend/dist/
 docs/*-task*.md
 docs/*-review*.md
 docs/*-plan*.md
+docs/d7-benchmark*.md
