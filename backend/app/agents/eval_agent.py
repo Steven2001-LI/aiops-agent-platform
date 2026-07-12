@@ -19,6 +19,8 @@ AIOps Agent Platform - Eval Agent
 
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
@@ -27,6 +29,7 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from app.agents.base import AgentResult, BaseAgent
+from app.config import get_config
 from app.evaluation.core import get_evaluation_framework
 from app.evaluation.end_to_end import EndToEndEvaluator
 from app.evaluation.metrics import (
@@ -68,6 +71,7 @@ from app.models.events import (
     SeverityLevel,
 )
 from app.models.incident import Incident, IncidentMetrics, IncidentPhase, IncidentState
+from app.services.llm_service import LLMService, LLMUnavailableError, get_llm_service
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -132,6 +136,11 @@ class ReasoningMetrics(BaseModel):
     reasoning_chain_quality: float = Field(default=0.0, description="推理链质量")
     suggested_action_accuracy: float = Field(default=0.0, description="建议操作准确率")
     mean_confidence: float = Field(default=0.0, description="平均置信度")
+    # D6 纯增量字段:LLM-as-Judge 明细(verdict + llm_meta + judge_score +
+    # rule_reasoning_score + fused_reasoning_score)。judge 未启用/降级/缺推理链时为 None。
+    # fused_reasoning_score 只存于此,不回写 reasoning_chain_quality、不参与
+    # _calculate_overall_score(对方案伪代码"合成分写回总分"的有意偏离,见改动摘要)。
+    judge: dict[str, Any] | None = Field(default=None, description="LLM 裁判评分明细")
 
 
 class ToolCallMetrics(BaseModel):
@@ -188,6 +197,26 @@ class EvalReport(BaseModel):
     )
 
 
+class JudgeVerdict(BaseModel):
+    """LLM 裁判对一次 RCA 推理的质量评分(1-5)"""
+
+    logical_coherence: int = Field(ge=1, le=5, description="推理链逻辑连贯性")
+    evidence_grounding: int = Field(ge=1, le=5, description="结论是否被引用的证据支撑")
+    plausibility: int = Field(ge=1, le=5, description="根因在运维语义上的合理性")
+    hallucination_detected: bool = Field(description="推理中是否使用了证据外的事实")
+    critique: str = Field(description="一句话评语,指出最主要缺陷或亮点")
+
+
+JUDGE_SYSTEM_PROMPT = """你是严格的 AIOps 评测裁判。给你一次故障的:证据包、系统输出的根因和推理链。\
+请按 rubric 独立打分,不要偏向系统结论。
+
+rubric:
+- logical_coherence:推理步骤间是否成立,有无跳跃/循环论证。
+- evidence_grounding:每步引用的证据编号是否真实存在且被正确使用;引用了不存在的证据 → 1 分并置 hallucination_detected=true。
+- plausibility:结论是否符合分布式系统故障传播常识。
+打分要拉开区分度:平庸=3,明显缺陷≤2,无可挑剔才是 5。"""
+
+
 class EvalAgent(BaseAgent[EvalInput, EvalReport]):
     """
     评估 Agent
@@ -201,7 +230,10 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
     - 历史评估追踪
     """
 
-    def __init__(self) -> None:
+    # 离线评测比交互端点宽松,但 judge 调用必须有界(外层 BaseAgent 也有 120s 预算)
+    JUDGE_TIMEOUT_SECONDS: float = 20.0
+
+    def __init__(self, llm_service: LLMService | None = None) -> None:
         super().__init__()
         # 历史评估结果
         self._eval_history: list[EvalReport] = []
@@ -212,6 +244,12 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         self._rag_evaluator = RAGEvaluator()
         # 框架核心
         self._framework = get_evaluation_framework()
+        # D6 LLM-as-Judge 注入口(对齐 rca_agent 修后模式)
+        self._llm_service: LLMService | None = llm_service
+        # 开关分支依据 _llm_injected 判,不看 _llm_service 是否为 None:
+        # _resolve_llm_service 懒加载会把全局单例写回 _llm_service,
+        # 未注入(生产路径)永远读全局配置,开关随 reload_config() 生效。
+        self._llm_injected: bool = llm_service is not None
 
     def get_name(self) -> str:
         return "eval_agent"
@@ -261,6 +299,10 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
             if input_data.eval_type in (EvalType.REASONING, EvalType.FULL):
                 report.reasoning = self._eval_reasoning(input_data)
+                # D6: 规则推理分算完后追加 LLM-as-Judge 融合(纯增量,局部闭环降级)
+                report.reasoning = await self._maybe_judge_reasoning(
+                    report.reasoning, input_data
+                )
                 reasoning_result = await self._framework.evaluate(
                     EvaluationType.REASONING,
                     target_agent=input_data.target_agent,
@@ -607,6 +649,132 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             suggested_action_accuracy=round(action_acc, 4),
             mean_confidence=round(float(np.mean(confidences)), 4) if confidences else 0.0,
         )
+
+    # ==================== LLM-as-Judge(D6)====================
+
+    def _judge_enabled(self) -> bool:
+        """读 enable_judge 开关。
+
+        每次 process() 调用时读,禁止 __init__ 快照(routes 函数内构造虽每次新实例,
+        但未注入路径仍须随 reload_config() 生效)。注入路径读注入配置;未注入(生产)
+        路径永远读全局配置。访问 _cfg 私有属性因 LLMService 未提供公开 accessor(同 rca_agent)。
+        """
+        if self._llm_injected and self._llm_service is not None:
+            return bool(self._llm_service._cfg.enable_judge)
+        return bool(get_config().llm.enable_judge)
+
+    def _resolve_llm_service(self) -> LLMService:
+        """懒加载全局 LLMService 单例并缓存(未注入生产路径)。"""
+        if self._llm_service is None:
+            self._llm_service = get_llm_service()
+        return self._llm_service
+
+    async def _maybe_judge_reasoning(
+        self,
+        metrics: ReasoningMetrics,
+        input_data: EvalInput,
+    ) -> ReasoningMetrics:
+        """推理维度 LLM-as-Judge 融合(纯增量,局部闭环降级)。
+
+        - 开关关 / 无 RCA 产物 / 缺推理链(rule_only 产物)→ 原样返回:
+          judge=None,合成分回归纯规则分(权重自动回归,方案原文语义)。
+        - judge 成功 → 融合明细写入 metrics.judge(verdict + llm_meta + judge_score +
+          rule_reasoning_score + fused_reasoning_score),既有字段一律不改。
+        - 降级三层(传输错 / 超时 / 裸异常)→ 只跳过 judge,规则分与报告原样保留,
+          绝不 re-raise、绝不让异常冒到 process() 外层兜底(整份报告会被吃掉)。
+
+        judge 每次 process ≤1 次,评 rca_results[0] 的推理链
+        (与 _eval_reasoning 自身只取 [0] 的链/证据约定一致,成本 O(1)/run)。
+        """
+        if not self._judge_enabled():
+            return metrics
+
+        rca_results = [
+            r for r in input_data.agent_results if r.get("agent_name") == "rca_agent"
+        ]
+        if not rca_results:
+            return metrics
+
+        output_data = rca_results[0].get("output_data", {})
+        # 证据从 rca_event.evidence 取(现状诊断 :60);不唤醒 _eval_reasoning 的
+        # output_data.get("evidence") 沉睡读取,不改 evidence_completeness 行为。
+        evidence = output_data.get("rca_event", {}).get("evidence", {})
+        reasoning_chain = evidence.get("reasoning_chain")
+        if not reasoning_chain:
+            # rule_only 产物无推理链:跳过 judge(缺链评分不可靠且浪费 token)
+            return metrics
+
+        evidence_pack = {
+            "reasoning_chain": reasoning_chain,
+            "bayesian_top_causes": evidence.get("bayesian_top_causes", []),
+            "rag_matches": evidence.get("rag_matches", []),
+            "impact_chain_detail": evidence.get("impact_chain_detail", []),
+            "evidence_used": evidence.get("evidence_used", []),
+        }
+        rca_output = {
+            "root_cause": output_data.get("root_cause"),
+            "confidence": output_data.get("confidence"),
+            "impact_chain": output_data.get("rca_event", {}).get("impact_chain", []),
+        }
+
+        llm = self._resolve_llm_service()
+        # 独立模型配置防同源偏置(judge_model 可指向不同于 RCA 的模型);
+        # temperature 必须显式传 0.0(structured_completion 的 None 会落全局配置,裁判要可复现)。
+        judge_model = llm._cfg.judge_model or None
+        try:
+            verdict, meta = await asyncio.wait_for(
+                llm.structured_completion(
+                    system=JUDGE_SYSTEM_PROMPT,
+                    user=json.dumps(
+                        {"evidence_pack": evidence_pack, "rca_output": rca_output},
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    schema=JudgeVerdict,
+                    call_name="eval_judge",
+                    model=judge_model,
+                    temperature=0.0,
+                    max_tokens=400,
+                ),
+                timeout=self.JUDGE_TIMEOUT_SECONDS,
+            )
+        except (LLMUnavailableError, TimeoutError) as e:
+            # wait_for 超时抛的 TimeoutError 无 message,error_type 才是有效诊断字段
+            logger.warning(
+                "Judge LLM unavailable, skip fusion",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
+            return metrics
+        except Exception as e:
+            # 按设计吞掉真正的代码 bug(不 re-raise,否则 process() :353 外层兜底
+            # 会把整份评测报告吞成 failure_result),此日志是 bug 唯一现场,必须带堆栈
+            logger.error(
+                "Judge LLM unexpected error, skip fusion",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            return metrics
+
+        # 融合:judge_score = 三项分和 / 15.0;合成分 = 0.6×规则推理分 + 0.4×judge_score
+        judge_score = (
+            verdict.logical_coherence
+            + verdict.evidence_grounding
+            + verdict.plausibility
+        ) / 15.0
+        rule_reasoning_score = metrics.reasoning_chain_quality
+        fused = round(0.6 * rule_reasoning_score + 0.4 * judge_score, 4)
+        # fused 只存于 judge dict:不回写 reasoning_chain_quality、不入 overall_score
+        # (对方案伪代码"合成分写回总分"的有意偏离,纯增量最安全;是否参与 overall_score 留 D7)
+        metrics.judge = {
+            **verdict.model_dump(),
+            "llm_meta": meta,
+            "judge_score": round(judge_score, 4),
+            "rule_reasoning_score": rule_reasoning_score,
+            "fused_reasoning_score": fused,
+        }
+        return metrics
 
     # ==================== 工具调用评估 ====================
 

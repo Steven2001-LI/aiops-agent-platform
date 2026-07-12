@@ -18,6 +18,7 @@ from pydantic import BaseModel as PydanticBaseModel, Field
 from app.agents.base import AgentExecutionContext
 from app.agents.business_monitor_agent import BusinessMetricInput, BusinessMonitorAgent
 from app.agents.change_agent import ChangeAgent, ChangeInput
+from app.agents.eval_agent import EvalAgent, EvalInput, EvalType
 from app.agents.heal_agent import HealAgent, HealInput
 from app.agents.monitor_agent import MetricInput, MonitorAgent
 from app.agents.rca_agent import RCAAgent, RCAInput
@@ -1101,16 +1102,70 @@ async def run_evaluation(
     eval_type: EvaluationType,
     agent_type: str | None = None,
 ) -> dict[str, Any]:
-    """执行评估"""
+    """执行评估
+
+    D6 接真:构造 EvalInput(默认测试集 + 从 _incident_service 现有故障重建的 RCA
+    产物,即真实冒烟"先 trigger 后 run"的数据面)→ 调 EvalAgent。响应保留既有 4 个
+    key(兼容任何依赖方,status 字面量恒为 "started"),评测产出增量附加;空库或
+    reasoning 缺数据导致 process 降级为 failure 时,增量键优雅缺席、端点仍返回 202。
+    judge 开关由 EvalAgent.process() 每次读全局配置(未注入路径)。
+    """
     logger.info("Run evaluation requested", eval_type=eval_type.value, agent_type=agent_type)
 
     eval_id = f"eval-run-{uuid.uuid4().hex[:8]}"
-    return {
+
+    # EvaluationType → EvalType(safety/performance 无对应维度 → 落 FULL)
+    try:
+        mapped_type = EvalType(eval_type.value)
+    except ValueError:
+        mapped_type = EvalType.FULL
+
+    # 从现有故障重建 rca_agent 产物(带推理链的 RCA 产物才可被 judge 评价)
+    agent_results: list[dict[str, Any]] = []
+    for inc in _incident_service._incidents.values():
+        if inc.rca_event is not None:
+            rca_event = inc.rca_event
+            agent_results.append(
+                {
+                    "agent_name": "rca_agent",
+                    "output_data": {
+                        "rca_event": rca_event.model_dump(),
+                        "root_cause": rca_event.root_cause,
+                        "confidence": rca_event.confidence,
+                        "impact_chain": rca_event.impact_chain,
+                        "suggested_actions": rca_event.recommended_actions,
+                    },
+                }
+            )
+
+    eval_input = EvalInput(
+        eval_type=mapped_type,
+        target_agent=agent_type or "",
+        test_cases=EvalAgent._get_default_test_cases(),
+        agent_results=agent_results,
+    )
+
+    # 函数内构造(白名单不允许模块级单例);process() 每次读 enable_judge 开关
+    eval_agent = EvalAgent()
+    ctx = AgentExecutionContext(
+        incident_id=eval_id,
+        input_data={"eval_type": mapped_type.value},
+    )
+    result = await eval_agent.execute(eval_input, ctx)
+
+    # 既有 4 key 原样保留(守住 test_api.py 绿基线)
+    response: dict[str, Any] = {
         "eval_id": eval_id,
         "status": "started",
         "eval_type": eval_type.value,
         "message": f"Evaluation task {eval_id} started — results will be available shortly",
     }
+    # 增量:诚实反映实际执行结果(降级/空库时优雅缺席)
+    if result.success and result.output_data:
+        response["execution"] = "completed"
+        response["report"] = result.output_data.get("report")
+        response["overall_score"] = result.output_data.get("overall_score")
+    return response
 
 
 # =============================================================================
