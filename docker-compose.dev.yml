@@ -1,0 +1,250 @@
+# =============================================================================
+# AIOps Agent Platform - Docker Compose (Development)
+# =============================================================================
+# 开发环境配置，支持：
+#   - 代码热重载（Hot Reload）
+#   - 调试模式
+#   - 自动API文档
+#   - 源代码卷挂载（无需重建容器）
+#   - Prometheus + AlertManager + Node Exporter 监控栈
+# =============================================================================
+
+version: "3.8"
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+  # ---------------------------------------------------------------------------
+  # Backend API Service (Development Mode)
+  # ---------------------------------------------------------------------------
+  backend-dev:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: builder
+    container_name: aiops-backend-dev
+    restart: "no"
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - APP_LOG_LEVEL=DEBUG
+      - APP_DEBUG=true
+      - APP_CORS_ORIGINS=http://localhost:8080,http://localhost:3000,http://localhost:5173
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_TEMPERATURE=0.1
+      - LLM_MAX_TOKENS=4096
+      - LLM_TIMEOUT_SECONDS=60
+      - LLM_MAX_RETRIES=3
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-${LLM_API_KEY:-}}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-false}
+      - DATABASE_URL=sqlite:///./data/aiops.db
+      - AGENT_EXECUTION_TIMEOUT_SECONDS=120
+      - AGENT_MAX_ITERATIONS=10
+      - AGENT_PARALLEL_WORKERS=3
+      - AGENT_HEAL_DRY_RUN=true
+      - AGENT_RCA_MIN_CONFIDENCE=0.7
+      - MEMORY_SHORT_TERM_MAX_ITEMS=100
+      - MEMORY_LONG_TERM_MAX_ITEMS=10000
+      - MEMORY_SIMILARITY_THRESHOLD=0.85
+      - MEMORY_RETENTION_DAYS=90
+      - WS_HEARTBEAT_INTERVAL_SECONDS=30
+      - WS_MAX_CONNECTIONS=100
+      - CHROMA_DB_PATH=./data/chroma
+      - CHROMA_DB_HOST=chroma-dev
+      - CHROMA_DB_PORT=8000
+      # --- Prometheus 地址（后端查询用） ---
+      - PROMETHEUS_URL=http://prometheus:9090
+    volumes:
+      - ./backend/app:/app/app:ro
+      - aiops-dev-data:/app/data
+      - ./backend/logs:/app/logs
+    networks:
+      - aiops-dev-network
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/app
+      --log-level debug
+      --access-log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Frontend Web Service (Development Mode)
+  # ---------------------------------------------------------------------------
+  frontend-dev:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: builder
+    container_name: aiops-frontend-dev
+    restart: "no"
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000/ws
+    volumes:
+      - ./frontend/src:/app/src:ro
+      - ./frontend/public:/app/public:ro
+      - ./frontend/index.html:/app/index.html:ro
+      - ./frontend/vite.config.ts:/app/vite.config.ts:ro
+      - ./frontend/tailwind.config.js:/app/tailwind.config.js:ro
+      - ./frontend/postcss.config.js:/app/postcss.config.js:ro
+      - ./frontend/tsconfig.json:/app/tsconfig.json:ro
+    working_dir: /app
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 3000"
+    networks:
+      - aiops-dev-network
+    depends_on:
+      - backend-dev
+
+  # ---------------------------------------------------------------------------
+  # ChromaDB - Vector Database (Development)
+  # ---------------------------------------------------------------------------
+  chroma-dev:
+    image: chromadb/chroma:latest
+    container_name: aiops-chroma-dev
+    restart: "no"
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-dev-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - aiops-dev-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — 监控指标采集与告警规则评估
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aiops-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+      - "--storage.tsdb.retention.time=15d"
+    networks:
+      - aiops-dev-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # AlertManager — 告警分组/去重/路由 → Webhook 推送到 Backend
+  # ---------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: aiops-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./infrastructure/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    networks:
+      - aiops-dev-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Node Exporter — 宿主机 CPU/内存/磁盘/网络 指标暴露
+  # ---------------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: aiops-node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^(sys|proc|dev|host|etc)($$|/)"
+    networks:
+      - aiops-dev-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  aiops-dev-data:
+    driver: local
+  chroma-dev-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  alertmanager-data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  aiops-dev-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.26.0.0/16

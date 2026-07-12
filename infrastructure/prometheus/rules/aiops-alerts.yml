@@ -1,0 +1,147 @@
+# =============================================================================
+# AIOps Platform — Prometheus Alerting Rules
+# =============================================================================
+# 来源：基于 awesome-prometheus-alerts 社区规则适配
+# 这些规则触发后由 AlertManager 推送到 AIOps Backend Webhook
+# =============================================================================
+
+groups:
+  # ===========================================================================
+  # 基础设施告警 — CPU / Memory / Disk
+  # ===========================================================================
+  - name: infrastructure
+    interval: 30s
+    rules:
+      # --- CPU ---
+      - alert: HighCPUUsage
+        expr: |
+          (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          category: infrastructure
+        annotations:
+          summary: "CPU 使用率过高 (instance {{ $labels.instance }})"
+          description: "CPU 使用率已超过 80%，持续 5 分钟，当前值 {{ $value | humanize }}%"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "{{ $labels.instance }}"
+          metric: "cpu_usage_percent"
+
+      - alert: CriticalCPUUsage
+        expr: |
+          (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          category: infrastructure
+        annotations:
+          summary: "CPU 使用率严重过高 (instance {{ $labels.instance }})"
+          description: "CPU 使用率已超过 95%，持续 2 分钟，当前值 {{ $value | humanize }}%"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "{{ $labels.instance }}"
+          metric: "cpu_usage_percent"
+
+      # --- Memory ---
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          category: infrastructure
+        annotations:
+          summary: "内存使用率过高 (instance {{ $labels.instance }})"
+          description: "内存使用率已超过 85%，持续 5 分钟，当前值 {{ $value | humanize }}%"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "{{ $labels.instance }}"
+          metric: "memory_usage_percent"
+
+      - alert: CriticalMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          category: infrastructure
+        annotations:
+          summary: "内存使用率严重过高 (instance {{ $labels.instance }})"
+          description: "内存使用率已超过 95%，持续 2 分钟，当前值 {{ $value | humanize }}%"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "{{ $labels.instance }}"
+          metric: "memory_usage_percent"
+
+      # --- Disk ---
+      - alert: HighDiskUsage
+        expr: |
+          (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          category: infrastructure
+        annotations:
+          summary: "磁盘使用率过高 (instance {{ $labels.instance }})"
+          description: "磁盘 {{ $labels.mountpoint }} 使用率超过 85%，当前值 {{ $value | humanize }}%"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "{{ $labels.instance }}"
+          metric: "disk_usage_percent"
+
+      # --- Node Down ---
+      - alert: NodeDown
+        expr: up{job="node-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: infrastructure
+        annotations:
+          summary: "节点不可达 (instance {{ $labels.instance }})"
+          description: "Node Exporter {{ $labels.instance }} 已失联超过 1 分钟"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "{{ $labels.instance }}"
+          metric: "node_down"
+
+  # ===========================================================================
+  # 应用层告警 — AIOps Backend
+  # ===========================================================================
+  - name: application
+    interval: 30s
+    rules:
+      - alert: BackendDown
+        expr: up{job="aiops-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: application
+        annotations:
+          summary: "AIOps Backend 不可达"
+          description: "AIOps Backend 服务已失联超过 1 分钟"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "aiops-backend"
+          metric: "service_down"
+
+      - alert: HighErrorRate
+        expr: |
+          rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: high
+          category: application
+        annotations:
+          summary: "AIOps Backend 错误率过高"
+          description: "5xx 错误率超过 5%，持续 5 分钟"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "aiops-backend"
+          metric: "error_rate_percent"
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          category: application
+        annotations:
+          summary: "AIOps Backend P99 延迟过高"
+          description: "P99 请求延迟超过 1 秒，持续 5 分钟"
+          runbook_url: "http://localhost:8000/api/v1/incidents/trigger"
+          service: "aiops-backend"
+          metric: "p99_latency_ms"

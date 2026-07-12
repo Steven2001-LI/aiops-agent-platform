@@ -1,0 +1,29 @@
+# =============================================================================
+# AIOps Platform — AlertManager Configuration
+# =============================================================================
+# 接收 Prometheus 告警，通过 webhook 推送到 AIOps Backend
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+
+# =============================================================================
+# 路由 — 所有告警都发送到 AIOps Backend webhook
+# =============================================================================
+route:
+  receiver: "aiops-webhook"
+  group_by: ["alertname", "severity"]
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 5m
+
+# =============================================================================
+# Receivers — 接收器定义
+# =============================================================================
+receivers:
+  - name: "aiops-webhook"
+    webhook_configs:
+      - url: "http://host.docker.internal:8000/api/v1/webhooks/alertmanager"
+        send_resolved: true
+        http_config:
+          follow_redirects: true

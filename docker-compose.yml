@@ -1,0 +1,151 @@
+# =============================================================================
+# AIOps Agent Platform - Docker Compose (Production)
+# =============================================================================
+# 生产环境编排配置，包含：
+#   - Backend API 服务 (FastAPI + Uvicorn)
+#   - Frontend Web 服务 (Nginx + React SPA)
+#   - ChromaDB 向量数据库服务
+# =============================================================================
+
+version: "3.8"
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+  # ---------------------------------------------------------------------------
+  # Backend API Service
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aiops-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # --- 应用基础配置 ---
+      - APP_ENV=production
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - APP_LOG_LEVEL=INFO
+      - APP_DEBUG=false
+      - APP_CORS_ORIGINS=http://localhost:8080,http://localhost:3000
+      # --- LLM 配置 ---
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_TEMPERATURE=0.1
+      - LLM_MAX_TOKENS=4096
+      - LLM_TIMEOUT_SECONDS=60
+      - LLM_MAX_RETRIES=3
+      # --- OpenAI 专用配置（向后兼容） ---
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-${LLM_API_KEY:-}}
+      # --- DeepSeek 专用配置 ---
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      # --- Langfuse 可观测性配置 ---
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-false}
+      # --- 数据库配置 ---
+      - DATABASE_URL=sqlite:///./data/aiops.db
+      - DATABASE_POOL_SIZE=10
+      - DATABASE_MAX_OVERFLOW=20
+      # --- Agent 配置 ---
+      - AGENT_EXECUTION_TIMEOUT_SECONDS=120
+      - AGENT_MAX_ITERATIONS=10
+      - AGENT_PARALLEL_WORKERS=3
+      - AGENT_HEAL_DRY_RUN=true
+      - AGENT_RCA_MIN_CONFIDENCE=0.7
+      # --- 记忆系统配置 ---
+      - MEMORY_SHORT_TERM_MAX_ITEMS=100
+      - MEMORY_LONG_TERM_MAX_ITEMS=10000
+      - MEMORY_SIMILARITY_THRESHOLD=0.85
+      - MEMORY_RETENTION_DAYS=90
+      # --- WebSocket 配置 ---
+      - WS_HEARTBEAT_INTERVAL_SECONDS=30
+      - WS_MAX_CONNECTIONS=100
+      # --- ChromaDB 配置 ---
+      - CHROMA_DB_PATH=./data/chroma
+      - CHROMA_DB_HOST=chroma
+      - CHROMA_DB_PORT=8000
+    volumes:
+      # 数据持久化（SQLite + ChromaDB本地缓存）
+      - aiops-data:/app/data
+    networks:
+      - aiops-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Frontend Web Service (Nginx + React SPA)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aiops-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - aiops-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # ChromaDB - Vector Database Service
+  # ---------------------------------------------------------------------------
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: aiops-chroma
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - aiops-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+# =============================================================================
+# Volumes (数据持久化)
+# =============================================================================
+volumes:
+  aiops-data:
+    driver: local
+  chroma-data:
+    driver: local
+
+# =============================================================================
+# Networks (服务间通信)
+# =============================================================================
+networks:
+  aiops-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
