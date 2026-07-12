@@ -3,10 +3,14 @@ AIOps Agent Platform - RCA Agent
 
 根因分析 Agent，负责故障根因分析。
 集成知识图谱查询、贝叶斯推理、BFS 遍历和 RAG 增强。
+支持 LLM 证据融合推理（enable_rca 开关），LLM 不可用时降级规则路径。
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,10 +19,12 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from app.agents.base import AgentResult, BaseAgent
+from app.config import get_config
 from app.data.knowledge_base import KNOWLEDGE_BASE, SERVICE_TOPOLOGY
 from app.models.agent import AgentExecutionContext
 from app.models.events import AlertEvent, RCAEvent, SeverityLevel
 from app.models.memory import MemoryType
+from app.services.llm_service import LLMService, LLMUnavailableError, get_llm_service
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +54,35 @@ class ServiceImpact(BaseModel):
     hop_distance: int = Field(default=-1, description="距离告警服务的跳数")
     tier: str = Field(default="standard", description="服务等级")
     related_changes: list[dict[str, Any]] = Field(default_factory=list, description="相关变更")
+
+
+class LLMRootCauseAnalysis(BaseModel):
+    """LLM 根因融合推理输出（闭集约束在运行时校验）"""
+    root_cause: str = Field(description="根因，必须从候选列表中选择")
+    confidence: float = Field(ge=0.0, le=1.0, description="置信度")
+    reasoning_chain: list[str] = Field(
+        min_length=2, max_length=8,
+        description="推理链，每步一句话，须引用证据编号如 [E1]",
+    )
+    evidence_used: list[str] = Field(
+        description="使用的证据路：topology/bayesian/rag/memory/rules 的子集",
+    )
+    alternative_hypothesis: str = Field(default="", description="次优假设（候选列表内）")
+    alternative_rejected_because: str = Field(default="", description="排除次优假设的理由")
+    suggested_actions: list[str] = Field(default_factory=list, max_length=6)
+    needs_human_review: bool = Field(default=False, description="证据矛盾/置信度不足时置 true")
+
+
+RCA_SYSTEM_PROMPT = """你是资深 SRE 根因分析专家。你将收到一次线上故障的多路诊断证据，\
+请融合所有证据推理出最可能的根因。
+
+规则：
+1. root_cause 只能从"候选根因"列表中选择，禁止编造列表外的根因。
+2. reasoning_chain 每一步必须引用证据编号（[E1]、[E2]...），不得使用证据中不存在的事实。
+3. 各路证据可能互相矛盾：贝叶斯先验反映统计规律，历史记忆反映本系统真实发生过的案例，\
+拓扑决定传播方向。矛盾时优先解释矛盾，而不是忽略。
+4. 若最高候选与次优候选证据强度接近，如实降低 confidence 并给出 alternative_hypothesis。
+5. 证据不足以定位时，needs_human_review 置 true。"""
 
 
 class RCAInput(BaseModel):
@@ -141,12 +176,25 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         },
     }
 
-    def __init__(self) -> None:
+    # LLM 融合调用的总预算：须满足 LLM 预算 + 规则路径耗时 ≪ base.py 的 120s agent 超时，
+    # 否则超时注入的 CancelledError 会绕过 LLMUnavailableError 降级分支
+    LLM_SYNTHESIS_TIMEOUT_SECONDS: float = 30.0
+
+    def __init__(self, llm_service: LLMService | None = None) -> None:
+        """
+        Args:
+            llm_service: 显式注入的 LLM 服务（测试路径）；
+                         None 时在首次使用时懒加载全局单例（生产路径）。
+        """
         super().__init__()
         self._service_topology = SERVICE_TOPOLOGY
         self._knowledge_base = KNOWLEDGE_BASE
         self._memory_system = None
         self._memory_init_attempted = False
+        self._llm_service: LLMService | None = llm_service
+        # 开关分支依据：_resolve_llm_service 懒加载会把全局单例写回 _llm_service，
+        # 用 "is not None" 判注入与否，首次 LLM 调用后生产路径会退化成配置快照
+        self._llm_injected: bool = llm_service is not None
 
     async def _get_memory_system(self):
         """惰性初始化 MemorySystem，失败后不再重试。"""
@@ -210,16 +258,78 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         # Step 3a: 记忆增强 - 从 MemorySystem 检索历史相似故障
         memory_results = await self._search_historical_incidents(alert, symptoms)
 
-        # Step 4: 综合分析 - 合并贝叶斯 + RAG + 历史记忆
-        root_cause, confidence, evidence = self._synthesize_analysis(
+        # Step 4a: 规则综合 - 合并贝叶斯 + RAG + 历史记忆（LLM 的一路输入 + 降级兜底）
+        rule_result = self._rule_based_synthesis(
             bayesian_results, rag_results, impact_chain, alert,
             memory_results=memory_results,
         )
+        root_cause, confidence, _rule_evidence = rule_result
+        reasoning_mode = "rule_only"
+        llm_analysis: LLMRootCauseAnalysis | None = None
+        llm_evidence: dict[str, Any] = {}
+
+        # Step 4b: LLM 证据融合。开关在每次调用时读，禁止 __init__ 快照
+        # （routes 的模块级单例会把快照固化，运行时开关失效）
+        if self._llm_enabled():
+            try:
+                llm_analysis, llm_meta = await asyncio.wait_for(
+                    self._llm_synthesize(
+                        alert, symptoms, impact_chain,
+                        bayesian_results, rag_results, memory_results, rule_result,
+                    ),
+                    timeout=self.LLM_SYNTHESIS_TIMEOUT_SECONDS,
+                )
+            except (LLMUnavailableError, TimeoutError) as e:
+                # wait_for 超时抛的 TimeoutError 无 message，error_type 才是有效诊断字段
+                reasoning_mode = "rule_fallback"
+                logger.warning(
+                    "RCA LLM unavailable, rule fallback",
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                )
+            except Exception as e:
+                # 降级必须在 process() 内完成且不 re-raise：异常冒泡会被 BaseAgent
+                # 兜底吞成 failure_result，routes 侧仍会把故障转成 RCA_COMPLETED。
+                # 这里按设计吞掉真正的代码 bug，此日志是 bug 唯一现场，必须带堆栈
+                reasoning_mode = "rule_fallback"
+                logger.error(
+                    "RCA LLM unexpected error, rule fallback",
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                    exc_info=True,
+                )
+            else:
+                reasoning_mode = "llm_hybrid"
+                # 一致性校准：比较用规范化值（同义不同串不算分歧），审计存原始串
+                if self._normalize_root_cause(llm_analysis.root_cause) == \
+                        self._normalize_root_cause(root_cause):
+                    confidence = round(
+                        min(0.98, max(confidence, llm_analysis.confidence) + 0.05), 4
+                    )
+                else:
+                    confidence = round(llm_analysis.confidence * 0.85, 4)
+                    llm_evidence["rule_llm_disagreement"] = {
+                        "rule": root_cause,
+                        "llm": llm_analysis.root_cause,
+                    }
+                root_cause = llm_analysis.root_cause
+                llm_evidence.update({
+                    "reasoning_chain": llm_analysis.reasoning_chain,
+                    "evidence_used": llm_analysis.evidence_used,
+                    "alternative_hypothesis": llm_analysis.alternative_hypothesis,
+                    "alternative_rejected_because": llm_analysis.alternative_rejected_because,
+                    "needs_human_review": llm_analysis.needs_human_review,
+                    "llm_meta": llm_meta,
+                })
 
         # Step 5: 生成建议操作
         suggested_actions = self._generate_suggested_actions(
             root_cause, impact_chain, rag_results
         )
+        if llm_analysis is not None and llm_analysis.suggested_actions:
+            for action in llm_analysis.suggested_actions:
+                if action not in suggested_actions:
+                    suggested_actions.append(action)
 
         # 构建 RCAEvent
         rca_event = RCAEvent(
@@ -251,6 +361,10 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
                 "alert_metric": alert.metric,
                 "alert_value": alert.value,
                 "alert_threshold": alert.threshold,
+                # 唯一能被 GET /incidents/{id} 序列化出去的位置，
+                # 不要写 4a 返回的 evidence dict（那是死值）
+                "reasoning_mode": reasoning_mode,
+                **llm_evidence,
             },
             recommended_actions=suggested_actions,
             time_range_start=datetime.now(timezone.utc) - timedelta(minutes=input_data.lookback_minutes),
@@ -665,7 +779,7 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
 
     # ==================== 综合分析 ====================
 
-    def _synthesize_analysis(
+    def _rule_based_synthesis(
         self,
         bayesian_results: list[BayesianNode],
         rag_results: list[dict[str, Any]],
@@ -674,7 +788,8 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         memory_results: list[dict[str, Any]] | None = None,
     ) -> tuple[str, float, dict[str, Any]]:
         """
-        综合分析 - 合并贝叶斯推理、RAG 结果和历史记忆
+        规则综合分析 - 合并贝叶斯推理、RAG 结果和历史记忆
+        （LLM 融合的一路输入 + LLM 不可用时的降级兜底）
 
         Returns:
             tuple: (根因, 置信度, 证据)
@@ -750,6 +865,9 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
 
         return root_cause, round(confidence, 4), evidence
 
+    # 兼容 tests/test_rca_agent.py:302 与 app/tests/test_agents.py:452 的直接调用，勿删
+    _synthesize_analysis = _rule_based_synthesis
+
     def _generate_suggested_actions(
         self,
         root_cause: str,
@@ -793,3 +911,134 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
                 actions.append("prepare_rollback")
 
         return actions
+
+    # ==================== LLM 证据融合 ====================
+
+    def _resolve_llm_service(self) -> LLMService:
+        """获取 LLM 服务：优先构造注入（测试路径），None 时懒加载全局单例（生产路径）。"""
+        if self._llm_service is None:
+            self._llm_service = get_llm_service()
+        return self._llm_service
+
+    def _llm_enabled(self) -> bool:
+        """
+        读 enable_rca 开关。
+
+        构造注入了 llm_service 时随注入的配置生效（测试隔离，不碰全局配置单例）；
+        访问 _cfg 私有属性是因为 LLMService 未提供公开 accessor。
+        未注入（生产路径）永远读全局配置：分支按 _llm_injected 判，不看
+        _llm_service 是否为 None——懒加载缓存单例后，开关仍须随 reload_config()
+        热更新生效，不许退化成单例创建时的配置快照。
+        """
+        if self._llm_injected and self._llm_service is not None:
+            return bool(self._llm_service._cfg.enable_rca)
+        return bool(get_config().llm.enable_rca)
+
+    @staticmethod
+    def _normalize_root_cause(value: str) -> str:
+        """
+        规范化根因串用于一致性比较：小写、去 "Root cause:" 前缀、
+        在首个 ","/"(" 处截断取根因短语。
+        规则路径的根因可能是记忆拼接串（如 "resource_exhaustion (historical_match: INC-42)"），
+        裸字符串比较会把同义不同串误判成分歧。
+        """
+        v = value.strip().lower()
+        if v.startswith("root cause:"):
+            v = v[len("root cause:"):].strip()
+        return re.split(r"[,(]", v, maxsplit=1)[0].strip()
+
+    async def _llm_synthesize(
+        self,
+        alert: AlertEvent,
+        symptoms: list[str],
+        impact_chain: list[ServiceImpact],
+        bayesian_results: list[BayesianNode],
+        rag_results: list[dict[str, Any]],
+        memory_results: list[dict[str, Any]],
+        rule_result: tuple[str, float, dict[str, Any]],
+    ) -> tuple[LLMRootCauseAnalysis, dict[str, Any]]:
+        """
+        LLM 证据融合推理。
+
+        四路证据 + 规则引擎初步结论打包成证据包，交给 LLM 生成根因假设与推理链。
+        闭集约束经 validate_extra 接入 structured_completion 的自修复重试环。
+        失败抛 LLMUnavailableError，由调用方降级规则路径。
+        """
+        rule_cause, rule_conf, _ = rule_result
+
+        # 闭集候选：贝叶斯全部先验类别 + RAG 命中条目的 root_causes
+        candidates: list[str] = list(self.PRIOR_PROBABILITIES.keys())
+        for m in rag_results[:3]:
+            for c in m.get("root_causes", []):
+                if c not in candidates:
+                    candidates.append(c)
+
+        # 规则初步结论可能是记忆拼接串/KB 开集值，不并入候选集（保持闭集纯净）；
+        # 出集时在 E5 显式注记，避免模型把出集"标准答案"当合法输出、推高自修复率
+        e5_preliminary: dict[str, Any] = {
+            "root_cause": rule_cause,
+            "confidence": rule_conf,
+        }
+        if rule_cause not in candidates:
+            e5_preliminary["note"] = (
+                "该初步结论不在候选根因列表内，仅供参考；"
+                "root_cause 仍必须从 candidate_root_causes 中选择"
+            )
+
+        evidence_pack: dict[str, Any] = {
+            "alert": {
+                "service": alert.service,
+                "metric": alert.metric,
+                "value": alert.value,
+                "threshold": alert.threshold,
+                "severity": alert.severity.value,
+                "symptoms": symptoms,
+            },
+            "E1_topology_impact": [
+                {"service": i.service, "hop": i.hop_distance,
+                 "tier": i.tier, "level": i.impact_level}
+                for i in impact_chain[:10]
+            ],
+            "E2_bayesian_top5": [
+                {"cause": r.name, "posterior": round(r.posterior, 4),
+                 "likelihood": round(r.likelihood, 3)}
+                for r in bayesian_results[:5]
+            ],
+            "E3_knowledge_base_matches": [
+                {"id": m["id"], "category": m.get("category"),
+                 "match_score": m.get("match_score"),
+                 "root_causes": m.get("root_causes", []),
+                 "solutions": m.get("solutions", [])[:3]}
+                for m in rag_results[:3]
+            ],
+            "E4_historical_memory": [
+                {"incident": m.get("source_incident"),
+                 "summary": (m.get("summary") or m.get("content", ""))[:200],
+                 "similarity": m.get("semantic_similarity")}
+                for m in memory_results[:3]
+            ],
+            "E5_rule_engine_preliminary": e5_preliminary,
+            "candidate_root_causes": candidates,
+        }
+
+        def _check_closed_set(parsed: LLMRootCauseAnalysis) -> str | None:
+            if parsed.root_cause not in candidates:
+                return (
+                    f"root_cause '{parsed.root_cause}' 不在候选列表中，"
+                    f"必须从 {candidates} 中选择"
+                )
+            if parsed.alternative_hypothesis and parsed.alternative_hypothesis not in candidates:
+                return "alternative_hypothesis 不在候选列表中"
+            return None
+
+        llm = self._resolve_llm_service()
+        return await llm.structured_completion(
+            system=RCA_SYSTEM_PROMPT,
+            # default=str 保底：证据里混入枚举/datetime 等不可序列化值时不许
+            # 抛 TypeError 绕过降级
+            user=json.dumps(evidence_pack, ensure_ascii=False, default=str),
+            schema=LLMRootCauseAnalysis,
+            call_name="rca_synthesize",
+            max_tokens=1200,
+            validate_extra=_check_closed_set,
+        )
