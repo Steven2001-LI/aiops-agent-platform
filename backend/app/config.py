@@ -31,6 +31,20 @@ class LLMConfig(BaseSettings):
     timeout_seconds: int = Field(default=60, gt=0, description="请求超时(秒)")
     max_retries: int = Field(default=3, ge=0, description="最大重试次数")
 
+    base_url: str = Field(default="", description="自定义 API base_url,优先于 provider 预设")
+
+    # 分模块模型选择:NLU/Judge 可用更便宜的模型,空 = 用主模型
+    nlu_model: str = Field(default="", description="NLU 慢路径模型")
+    judge_model: str = Field(default="", description="LLM-as-judge 模型")
+
+    # 功能开关:默认全关,合入零风险,逐个打开验收
+    enable_rca: bool = Field(default=False, description="RCA LLM 融合推理")
+    enable_nlu: bool = Field(default=False, description="NLU LLM 慢路径")
+    enable_judge: bool = Field(default=False, description="评测 LLM-as-judge")
+
+    # NLU 快慢路径切换阈值
+    nlu_fast_path_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+
 
 class LangfuseConfig(BaseSettings):
     """Langfuse 可观测性配置"""
