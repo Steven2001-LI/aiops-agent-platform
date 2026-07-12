@@ -46,8 +46,7 @@ from app.models.events import (
 )
 from app.models.incident import Incident, IncidentState
 from app.models.memory import MemoryType
-from app.nlu.entity_extractor import EntityExtractor
-from app.nlu.intent_classifier import IntentClassifier
+from app.nlu.hybrid import hybrid_understand
 from app.nlu.metric_mapper import MetricMapper
 from app.services.incident_service import IncidentService
 from app.utils.logging import get_logger
@@ -1415,13 +1414,10 @@ async def diagnose_from_natural_language(
 
     logger.info("NL diagnosis requested", query=query[:100])
 
-    # Layer 1: 意图识别
-    intent_classifier = IntentClassifier()
-    intent = intent_classifier.classify(query)
-
-    # Layer 2: 实体抽取
-    entity_extractor = EntityExtractor()
-    entities = entity_extractor.extract(query)
+    # Layer 1+2: 快慢路径混合 NLU(降级在 hybrid_understand 内闭环,永不 raise)
+    intent, entities, nlu_info = await hybrid_understand(
+        query, known_services=list(SERVICE_TOPOLOGY.keys()),
+    )
 
     # Layer 3: 指标映射
     metric_mapper = MetricMapper()
@@ -1490,6 +1486,8 @@ async def diagnose_from_natural_language(
             "type": intent.intent,
             "confidence": round(intent.confidence, 4),
         },
+        "nlu_path": nlu_info["path"],
+        "clarification_question": nlu_info.get("clarification", ""),
         "understood_as": {
             "services": entities.services,
             "symptoms": entities.symptoms,
