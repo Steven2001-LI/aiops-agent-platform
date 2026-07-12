@@ -83,3 +83,8 @@ frontend/dist/
 # Docker
 # =============================================================================
 .dockerignore
+
+# 内部工作文档(任务书/评审/计划),不入公开历史
+docs/*-task*.md
+docs/*-review*.md
+docs/*-plan*.md
