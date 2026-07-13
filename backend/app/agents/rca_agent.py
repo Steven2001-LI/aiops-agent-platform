@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
+from prometheus_client import Counter
 from pydantic import BaseModel, Field
 
 from app.agents.base import AgentResult, BaseAgent
@@ -28,6 +29,10 @@ from app.services.llm_service import LLMService, LLMUnavailableError, get_llm_se
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+RCA_PATH_TOTAL = Counter(
+    "aiops_rca_path_total", "RCA reasoning path outcomes", ["path"],
+)
 
 
 class BayesianNode(BaseModel):
@@ -321,6 +326,8 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
                     "needs_human_review": llm_analysis.needs_human_review,
                     "llm_meta": llm_meta,
                 })
+
+        RCA_PATH_TOTAL.labels(reasoning_mode).inc()
 
         # Step 5: 生成建议操作
         suggested_actions = self._generate_suggested_actions(

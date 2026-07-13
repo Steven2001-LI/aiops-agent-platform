@@ -12,6 +12,7 @@ import asyncio
 import json
 from typing import Literal
 
+from prometheus_client import Counter
 from pydantic import BaseModel, Field
 
 from app.config import get_config
@@ -21,6 +22,10 @@ from app.services.llm_service import LLMService, LLMUnavailableError, get_llm_se
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+NLU_PATH_TOTAL = Counter(
+    "aiops_nlu_path_total", "NLU understanding path outcomes", ["path"],
+)
 
 _classifier = IntentClassifier()
 _extractor = EntityExtractor()
@@ -117,6 +122,7 @@ async def hybrid_understand(
     if not cfg.enable_nlu or _fast_path_confident(
         intent, entities, cfg.nlu_fast_path_confidence
     ):
+        NLU_PATH_TOTAL.labels(info["path"]).inc()
         return intent, entities, info
 
     # ---- LLM 慢路径 ----
@@ -199,4 +205,5 @@ async def hybrid_understand(
             error_type=type(e).__name__, exc_info=True,
         )
 
+    NLU_PATH_TOTAL.labels(info["path"]).inc()
     return intent, entities, info
