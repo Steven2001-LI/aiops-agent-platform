@@ -75,7 +75,11 @@ class ChangeAgent(BaseAgent[ChangeInput, ChangeEvent]):
     }
 
     # 风险等级阈值
-    RISK_LEVEL_LOW = 0.30
+    # LOW 线 2026-07 校准 0.30 → 0.35:风险分含时间因素(0.15 权重),常规低风险
+    # 变更(auto_heal + 小爆炸半径 + 默认历史成功率)实测分布在 0.29-0.31 之间
+    # 随时段漂移,0.30 的线会让同一变更"上午自动批、下午等审批"。0.35 覆盖该
+    # 漂移带,仍远低于 MEDIUM(0.60),中高风险审批语义不变。
+    RISK_LEVEL_LOW = 0.35
     RISK_LEVEL_MEDIUM = 0.60
     RISK_LEVEL_HIGH = 0.80
 
