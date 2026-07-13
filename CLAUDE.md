@@ -14,13 +14,14 @@
 
 ## 测试纪律(最重要)
 
-- 当前基线:**4 failed / 251 passed**。以下 4 个失败是历史遗留,与当前工作无关,
+- 当前基线:**4 failed / 309 passed / 1 skipped**(D1-D7+D4.5+D5 集成后的实测值;
+  原 251 是 LLM 集成前的旧基线)。以下 4 个失败是历史遗留,与当前工作无关,
   不许修、不许删、不许 skip:
   - `app/tests/test_agents.py::TestEvalAgent::test_calibration_error`
   - `tests/test_api.py::TestIncidentEndpoints::test_list_incidents_with_filters`
   - `tests/test_api.py::TestIncidentEndpoints::test_get_incident`
   - `tests/test_routes_no_seed.py::test_seed_demo_endpoint_exists`
-- 不许让基线中 251 个通过的测试出现任何一个变红
+- 不许让基线中 309 个通过的测试出现任何一个变红
 - 每次任务完成必须跑全量 pytest,报告与基线的对比
 - 新功能的测试禁止调用真实 LLM API,用 fake client 按脚本返回
 - 禁止用 mock 注入业务结果糊弄断言(仓库有 `test_*_no_mock*` 传统,延续它)
