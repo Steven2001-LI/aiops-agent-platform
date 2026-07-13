@@ -60,7 +60,13 @@ def test_build_graph_returns_compiled_graph() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_alert_graph_happy_path_resolves_simulated() -> None:
+async def test_process_alert_graph_happy_path_resolves_simulated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def low_time_risk(self: ChangeAgent) -> float:
+        return 0.2
+
+    monkeypatch.setattr(ChangeAgent, "_calculate_time_risk", low_time_risk)
     orchestrator = Orchestrator()
     assert orchestrator.build_graph() is not None
 
@@ -83,6 +89,27 @@ async def test_process_alert_graph_happy_path_resolves_simulated() -> None:
         "awaiting_approval",
         "resolved",
     ]
+
+
+@pytest.mark.asyncio
+async def test_process_alert_graph_high_time_risk_stops_awaiting_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def high_time_risk(self: ChangeAgent) -> float:
+        return 0.9
+
+    monkeypatch.setattr(ChangeAgent, "_calculate_time_risk", high_time_risk)
+    orchestrator = Orchestrator()
+    assert orchestrator.build_graph() is not None
+
+    incident = await orchestrator.process_alert(_alert())
+
+    assert incident.state == IncidentState.AWAITING_APPROVAL
+    assert orchestrator.state == OrchestratorState.AWAITING_APPROVAL
+    assert incident.context["approval_status"] == "pending"
+    assert "resolution_mode" not in incident.context
+    assert _transition_targets(incident)[-1] == "awaiting_approval"
+    assert "resolved" not in _transition_targets(incident)
 
 
 @pytest.mark.asyncio
