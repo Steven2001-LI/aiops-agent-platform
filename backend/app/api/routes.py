@@ -861,6 +861,7 @@ async def list_incidents(
 
     result = await _incident_service.list(
         state=state,
+        severity=severity,
         service=service,
         page=params.page,
         page_size=params.page_size,

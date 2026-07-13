@@ -947,17 +947,23 @@ class TestEvalAgent:
 
     def test_calibration_error(self, agent: EvalAgent) -> None:
         """测试校准误差计算"""
-        # 完美校准
-        confidences = [0.1, 0.3, 0.5, 0.7, 0.9]
-        accuracies = [0.1, 0.3, 0.5, 0.7, 0.9]
-        ece = agent._calculate_calibration_error(confidences, accuracies)
-        assert ece < 0.15  # 完美校准时 ECE 应接近 0
+        from app.evaluation.metrics import confidence_calibration
 
-        # 差校准
-        confidences = [0.9, 0.9, 0.9, 0.9, 0.9]
-        accuracies = [0.1, 0.2, 0.1, 0.0, 0.1]
-        ece = agent._calculate_calibration_error(confidences, accuracies)
-        assert ece > 0.5  # 差校准时 ECE 应较大
+        # 每个置信度分组的真实正确率都与置信度一致。
+        confidences = [level for level in (0.1, 0.3, 0.5, 0.7, 0.9) for _ in range(10)]
+        correct = [
+            outcome
+            for correct_count in (1, 3, 5, 7, 9)
+            for outcome in ([True] * correct_count + [False] * (10 - correct_count))
+        ]
+        ece = confidence_calibration(confidences, correct)
+        assert ece < 0.01  # 完美校准时 ECE 应接近 0
+
+        # 只有 10% 的预测正确，却统一给出 90% 置信度。
+        overconfident = [0.9] * 10
+        mostly_incorrect = [True] + [False] * 9
+        ece = confidence_calibration(overconfident, mostly_incorrect)
+        assert ece > 0.5  # 过度自信时 ECE 应较大
 
     def test_default_test_cases(self, agent: EvalAgent) -> None:
         """测试默认测试用例"""

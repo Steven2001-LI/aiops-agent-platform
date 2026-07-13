@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.models.events import AlertEvent
+from app.models.events import AlertEvent, SeverityLevel
 from app.models.incident import (
     AgentExecutionRecord,
     Incident,
@@ -123,6 +123,7 @@ class IncidentService:
     async def list(
         self,
         state: IncidentState | None = None,
+        severity: SeverityLevel | str | None = None,
         service: str | None = None,
         page: int = 1,
         page_size: int = 20,
@@ -132,6 +133,7 @@ class IncidentService:
 
         Args:
             state: 状态过滤
+            severity: 严重级别过滤
             service: 服务过滤
             page: 页码
             page_size: 每页数量
@@ -140,9 +142,12 @@ class IncidentService:
             dict: 故障列表和分页信息
         """
         incidents = list(self._incidents.values())
+        severity_value = severity.value if isinstance(severity, SeverityLevel) else severity
 
         if state:
             incidents = [i for i in incidents if i.state == state]
+        if severity_value:
+            incidents = [i for i in incidents if i.severity.value == severity_value]
         if service:
             incidents = [i for i in incidents if i.service == service]
 
@@ -158,6 +163,11 @@ class IncidentService:
             "total": total,
             "page": page,
             "page_size": page_size,
+            "filters": {
+                "state": state.value if state else None,
+                "severity": severity_value,
+                "service": service,
+            },
         }
 
     async def update_metrics(

@@ -106,25 +106,62 @@ class TestIncidentEndpoints:
     def test_list_incidents_with_filters(self) -> None:
         """测试带过滤条件的故障列表"""
         client = TestClient(app)
+        service = "severity-filter-test-service"
+        for severity in ("critical", "high"):
+            trigger_response = client.post(
+                "/api/v1/incidents/trigger",
+                json={
+                    "service": service,
+                    "metric": f"{severity}_severity_test_metric",
+                    "value": 95.0,
+                    "threshold": 80.0,
+                    "severity": severity,
+                },
+            )
+            assert trigger_response.status_code == 202
+
         response = client.get(
-            "/api/v1/incidents?severity=critical&service=order-service"
+            "/api/v1/incidents",
+            params={"severity": "critical", "service": service},
         )
 
         assert response.status_code == 200
         data = response.json()
-        assert "filters" in data
+        assert data["items"]
+        assert all(item["severity"] == "critical" for item in data["items"])
+        assert all(item["service"] == service for item in data["items"])
+        assert data["filters"]["severity"] == "critical"
+        assert data["filters"]["service"] == service
 
     def test_get_incident(self) -> None:
         """
         测试故障详情查询
 
-        当前返回501（未实现），验证错误处理。
+        验证未知 ID 的 404 语义和已创建故障的详情查询。
         """
         client = TestClient(app)
-        response = client.get("/api/v1/incidents/test-123")
+        missing_id = "incident-that-does-not-exist"
+        response = client.get(f"/api/v1/incidents/{missing_id}")
 
-        # 未实现，返回501
-        assert response.status_code == 501
+        assert response.status_code == 404
+        assert response.json()["detail"] == f"Incident {missing_id} not found"
+
+        trigger_response = client.post(
+            "/api/v1/incidents/trigger",
+            json={
+                "service": "get-incident-test-service",
+                "metric": "latency_ms",
+                "value": 1500.0,
+                "threshold": 500.0,
+                "severity": "medium",
+            },
+        )
+        assert trigger_response.status_code == 202
+        incident_id = trigger_response.json()["incident_id"]
+
+        response = client.get(f"/api/v1/incidents/{incident_id}")
+        assert response.status_code == 200
+        assert response.json()["incident_id"] == incident_id
 
 
 class TestAgentEndpoints:

@@ -18,6 +18,14 @@ import pathlib
 _BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_BACKEND_ROOT))
 
+# 测试隔离:强制禁用 Langfuse。lifespan 测试(test_main_lifespan.py 的
+# with TestClient(app))会真跑启动流程,若不禁用,会用 backend/.env 的真实 key
+# 初始化真实 Langfuse 客户端并在进程退出时 flush 云端——测试摸真云端,且网络
+# 波动时在 pytest 输出尾部刷 "Unexpected error" 噪声。
+# pydantic-settings 中环境变量优先于 env_file,此处置 false 即覆盖 .env。
+import os
+os.environ["LANGFUSE_ENABLED"] = "false"
+
 
 # =============================================================================
 # Event Loop Policy

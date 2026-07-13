@@ -21,7 +21,6 @@ def test_seed_demo_endpoint_exists():
     """/incidents/seed-demo 端点必须存在"""
     from app.main import create_app
     app = create_app()
-    routes = [r.path for r in app.routes if hasattr(r, "path")]
-    assert "/api/v1/incidents/seed-demo" in routes, (
+    assert "/api/v1/incidents/seed-demo" in app.openapi()["paths"], (
         "seed-demo endpoint should be registered"
     )
