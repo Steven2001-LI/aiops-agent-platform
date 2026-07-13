@@ -73,6 +73,12 @@ def _fast_path_confident(
     阈值由调用方传入:注入路径读注入配置,生产路径读全局配置,
     本函数自己不碰 get_config。confidence == threshold 算有把握。
     """
+    # D4.5:服务与症状双双抽到,即可构造诊断计划,快路径足够——即便意图分类器
+    # 把明显故障("订单服务报错了""网关一直 503")误判成 general_question / 低置信
+    # (D7 离线实测暴露的分类器盲区)。实体成功才是可执行性的充分条件,意图分类
+    # 露怯不影响下游能否落地;只要求双非空,避免"只提服务没提症状"这类真模糊句被放行。
+    if entities.services and entities.symptoms:
+        return True
     if intent.intent == IntentType.GENERAL_QUESTION:
         return False
     if intent.confidence < threshold:

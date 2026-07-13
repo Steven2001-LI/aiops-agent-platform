@@ -130,6 +130,48 @@ async def test_fast_rule_high_confidence() -> None:
 
 
 # =============================================================================
+# 用例 1b:fast_rule —— 服务+症状双非空即快路径,即便意图被误判 general_question
+# (D4.5:D7 实测暴露分类器盲区,实体成功才是可执行性充分条件)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_when_entities_present_despite_weak_intent() -> None:
+    # "订单服务报错了" 实测 general_question/0.0,但服务+症状都干净抽到 →
+    # 应走快路径零成本(旧判据会因 general_question 误升级 LLM)
+    svc, fake = make_nlu_service([], fast_path_confidence=0.3)
+
+    intent, entities, info = await hybrid_understand(
+        "订单服务报错了", known_services=KNOWN_SERVICES, llm_service=svc
+    )
+
+    assert entities.services == ["order-service"]
+    assert entities.symptoms == ["high_error_rate"]
+    assert info["path"] == "fast_rule"  # 双实体非空 → 快路径,不烧 LLM
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_service_only_no_symptom_still_slow() -> None:
+    # 只提服务、没提症状的真模糊句仍须走慢路径(判据要求"双非空",非"任一非空")。
+    # KAFKA_QUERY: general_question + services=[kafka] + symptoms=[]
+    svc, fake = make_nlu_service(
+        [make_fake_response(valid_nlu_json())], fast_path_confidence=0.3
+    )
+
+    # 规则侧抽取:只有服务、无症状(在返回值被 LLM 结果覆盖之前先验证)
+    rule_ents = hybrid_module._extractor.extract(KAFKA_QUERY)
+    assert rule_ents.services and not rule_ents.symptoms  # 服务非空、症状空
+
+    _, _, info = await hybrid_understand(
+        KAFKA_QUERY, known_services=KNOWN_SERVICES, llm_service=svc
+    )
+
+    assert info["path"] == "llm_enhanced"  # 不满足双非空 → 仍升级 LLM(补症状/反问)
+    assert len(fake.calls) == 1
+
+
+# =============================================================================
 # 用例 2:llm_enhanced —— 模糊句升级 LLM,结果换成 LLM 值
 # =============================================================================
 
@@ -478,16 +520,24 @@ async def test_malformed_schema_self_repair() -> None:
 
 
 def test_fast_path_confident_unit() -> None:
-    ents = AIOpsEntities(services=["order-service"], symptoms=["high_latency"])
+    both = AIOpsEntities(services=["order-service"], symptoms=["high_latency"])
+    svc_only = AIOpsEntities(services=["order-service"])  # 单实体,不触发 D4.5 短路
     empty = AIOpsEntities()
 
-    # 低置信 → 没把握
-    low = UserIntent(intent=IntentType.FAULT_DIAGNOSIS, confidence=0.35)
-    assert _fast_path_confident(low, ents, threshold=0.6) is False
+    # D4.5 新判据:服务+症状双非空 → 有把握,意图/置信度均不再一票否决
+    weak = UserIntent(intent=IntentType.GENERAL_QUESTION, confidence=0.0)
+    assert _fast_path_confident(weak, both, threshold=0.6) is True
+    low_but_both = UserIntent(intent=IntentType.FAULT_DIAGNOSIS, confidence=0.1)
+    assert _fast_path_confident(low_but_both, both, threshold=0.6) is True
 
-    # GENERAL_QUESTION(正则兜底类)→ 置信度再高也没把握
+    # 以下拒绝分支须用"非双实体"隔离(否则被 D4.5 短路成 True):
+    # 低置信 + 单实体 → 没把握
+    low = UserIntent(intent=IntentType.FAULT_DIAGNOSIS, confidence=0.35)
+    assert _fast_path_confident(low, svc_only, threshold=0.6) is False
+
+    # GENERAL_QUESTION + 单实体 → 置信度再高也没把握
     general = UserIntent(intent=IntentType.GENERAL_QUESTION, confidence=0.9)
-    assert _fast_path_confident(general, ents, threshold=0.6) is False
+    assert _fast_path_confident(general, svc_only, threshold=0.6) is False
 
     # 诊断类意图但服务/症状双空(下游没法构造告警)→ 没把握
     blind = UserIntent(intent=IntentType.FAULT_DIAGNOSIS, confidence=0.9)
@@ -495,7 +545,7 @@ def test_fast_path_confident_unit() -> None:
 
     # 正常:高置信 + 实体齐全 → 有把握
     good = UserIntent(intent=IntentType.FAULT_DIAGNOSIS, confidence=0.9)
-    assert _fast_path_confident(good, ents, threshold=0.6) is True
+    assert _fast_path_confident(good, both, threshold=0.6) is True
 
     # 修订 1 阈值边界:实测"看一下cpu多少" conf 恰好 0.6000 == 默认阈值,
     # 判据必须是 conf < threshold 才算没把握(== 阈值 → 有把握走快路径)。
