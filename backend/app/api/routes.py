@@ -1226,6 +1226,7 @@ async def list_evaluations(
 async def run_evaluation(
     eval_type: EvaluationType,
     agent_type: str | None = None,
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行评估
 
@@ -1235,7 +1236,9 @@ async def run_evaluation(
     reasoning 缺数据导致 process 降级为 failure 时,增量键优雅缺席、端点仍返回 202。
     judge 开关由 EvalAgent.process() 每次读全局配置(未注入路径)。
     """
-    logger.info("Run evaluation requested", eval_type=eval_type.value, agent_type=agent_type)
+    logger.info(
+        "Run evaluation requested", eval_type=eval_type.value, agent_type=agent_type
+    )
 
     eval_id = f"eval-run-{uuid.uuid4().hex[:8]}"
 
@@ -1245,21 +1248,87 @@ async def run_evaluation(
     except ValueError:
         mapped_type = EvalType.FULL
 
-    # 从现有故障重建 rca_agent 产物(带推理链的 RCA 产物才可被 judge 评价)
+    explicit_truths = (body or {}).get("ground_truth_by_incident", {})
+    if not isinstance(explicit_truths, dict):
+        explicit_truths = {}
+    scenarios_by_id = {scenario["id"]: scenario for scenario in FAULT_SCENARIOS}
+
+    def normalize_ground_truth(raw: dict[str, Any]) -> dict[str, Any]:
+        """把请求体/数据集的场景真值归一为 reasoning ground_truth。"""
+        truth = dict(raw)
+        expected_action = raw.get("expected_action", {})
+        if "suggested_actions" not in truth:
+            if isinstance(expected_action, dict) and expected_action.get("type"):
+                truth["suggested_actions"] = [expected_action["type"]]
+            elif isinstance(expected_action, str) and expected_action:
+                truth["suggested_actions"] = [expected_action]
+        # FAULT_SCENARIOS 没有单独 evidence 字段；metrics 是场景已知的
+        # 观测真值，只映射为 evidence_completeness 所比较的证据类型。
+        if "evidence" not in truth and raw.get("metrics"):
+            truth["evidence"] = {"alert_metric": raw["metrics"]}
+        return truth
+
+    # 从现有故障重建 rca_agent 产物，同时按 incident 粒度配对真值。
+    # 优先级：显式请求体 > context.scenario_id > incident_id > N/A。
     agent_results: list[dict[str, Any]] = []
-    for inc in _incident_service._incidents.values():
+    reasoning_samples: list[dict[str, Any]] = []
+    ground_truth_sources = {
+        "explicit": 0,
+        "context_scenario": 0,
+        "incident_id_scenario": 0,
+        "excluded": 0,
+        "total": 0,
+    }
+    for stored_incident_id, inc in _incident_service._incidents.items():
         if inc.rca_event is not None:
+            incident_id = str(getattr(inc, "incident_id", stored_incident_id))
             rca_event = inc.rca_event
-            agent_results.append(
+            agent_result = {
+                "incident_id": incident_id,
+                "agent_name": "rca_agent",
+                "output_data": {
+                    "rca_event": rca_event.model_dump(),
+                    "root_cause": rca_event.root_cause,
+                    "confidence": rca_event.confidence,
+                    "impact_chain": rca_event.impact_chain,
+                    "suggested_actions": rca_event.recommended_actions,
+                },
+            }
+            agent_results.append(agent_result)
+
+            raw_truth: dict[str, Any] | None = None
+            source: str | None = None
+            explicit_truth = explicit_truths.get(incident_id)
+            if explicit_truth is None and incident_id != str(stored_incident_id):
+                explicit_truth = explicit_truths.get(str(stored_incident_id))
+            if isinstance(explicit_truth, dict):
+                raw_truth = explicit_truth
+                source = "explicit"
+            else:
+                context = getattr(inc, "context", {}) or {}
+                scenario_id = (
+                    context.get("scenario_id") if isinstance(context, dict) else None
+                )
+                if scenario_id in scenarios_by_id:
+                    raw_truth = scenarios_by_id[scenario_id]
+                    source = "context_scenario"
+                elif incident_id in scenarios_by_id:
+                    raw_truth = scenarios_by_id[incident_id]
+                    source = "incident_id_scenario"
+
+            ground_truth = normalize_ground_truth(raw_truth) if raw_truth else {}
+            ground_truth_sources["total"] += 1
+            if source is not None and ground_truth.get("root_cause"):
+                ground_truth_sources[source] += 1
+            else:
+                ground_truth_sources["excluded"] += 1
+                ground_truth = {}
+
+            reasoning_samples.append(
                 {
-                    "agent_name": "rca_agent",
-                    "output_data": {
-                        "rca_event": rca_event.model_dump(),
-                        "root_cause": rca_event.root_cause,
-                        "confidence": rca_event.confidence,
-                        "impact_chain": rca_event.impact_chain,
-                        "suggested_actions": rca_event.recommended_actions,
-                    },
+                    "id": incident_id,
+                    "predicted": EvalAgent._prediction_from_rca_result(agent_result),
+                    "ground_truth": ground_truth,
                 }
             )
 
@@ -1268,6 +1337,7 @@ async def run_evaluation(
         target_agent=agent_type or "",
         test_cases=EvalAgent._get_default_test_cases(),
         agent_results=agent_results,
+        samples_by_type={"reasoning": reasoning_samples},
     )
 
     # 函数内构造(白名单不允许模块级单例);process() 每次读 enable_judge 开关
@@ -1284,6 +1354,7 @@ async def run_evaluation(
         "status": "started",
         "eval_type": eval_type.value,
         "message": f"Evaluation task {eval_id} started — results will be available shortly",
+        "ground_truth_sources": ground_truth_sources,
     }
     # 增量:诚实反映实际执行结果(降级/空库时优雅缺席)
     if result.success and result.output_data:

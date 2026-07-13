@@ -175,12 +175,12 @@ class EvalReport(BaseModel):
     """评估报告"""
 
     report_id: str = Field(
-        default_factory=lambda: f"eval-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        default_factory=lambda: (
+            f"eval-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        )
     )
     eval_type: str = Field(default="")
-    generated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     end_to_end: EndToEndMetrics = Field(default_factory=EndToEndMetrics)
     reasoning: ReasoningMetrics = Field(default_factory=ReasoningMetrics)
     tool_call: ToolCallMetrics = Field(default_factory=ToolCallMetrics)
@@ -194,6 +194,12 @@ class EvalReport(BaseModel):
     )
     eval_results: list[dict[str, Any]] = Field(
         default_factory=list, description="各维度详细评估结果"
+    )
+    # S7 纯增量字段：明确区分已评、不可评和未执行。
+    # 既有 metrics 数值字段保持 float 以兼容调用方；缺样本时此处 value=None
+    # 才是权威的 N/A 表达，且该指标不参与 overall_score。
+    score_coverage: dict[str, Any] = Field(
+        default_factory=dict, description="评分覆盖与 N/A 明细"
     )
 
 
@@ -285,17 +291,10 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         eval_results: list[EvaluationResult] = []
 
         try:
-            # 根据评估类型执行不同评估
+            # 先计算规则指标，再基于真实样本覆盖决定哪些维度
+            # 可以进入标准评测器和 overall_score。
             if input_data.eval_type in (EvalType.END_TO_END, EvalType.FULL):
                 report.end_to_end = self._eval_end_to_end(input_data)
-                # 同时通过框架执行标准化评估
-                e2e_result = await self._framework.evaluate(
-                    EvaluationType.END_TO_END,
-                    target_agent=input_data.target_agent,
-                    samples=input_data.samples_by_type.get("end_to_end")
-                    or input_data.test_cases,
-                )
-                eval_results.append(e2e_result)
 
             if input_data.eval_type in (EvalType.REASONING, EvalType.FULL):
                 report.reasoning = self._eval_reasoning(input_data)
@@ -303,15 +302,45 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
                 report.reasoning = await self._maybe_judge_reasoning(
                     report.reasoning, input_data
                 )
-                reasoning_result = await self._framework.evaluate(
-                    EvaluationType.REASONING,
-                    target_agent=input_data.target_agent,
-                    samples=input_data.samples_by_type.get("reasoning"),
-                )
-                eval_results.append(reasoning_result)
 
             if input_data.eval_type in (EvalType.TOOL_CALL, EvalType.FULL):
                 report.tool_call = self._eval_tool_call(input_data)
+
+            if input_data.eval_type in (EvalType.RAG, EvalType.FULL):
+                report.rag = self._eval_rag(input_data)
+
+            report.score_coverage = self._build_score_coverage(input_data, report)
+
+            # 无有有效样本的维度不调标准评测器，避免其内部默认数据集
+            # 为本次真实空数据生成伪 benchmark 分数。
+            if report.score_coverage["end_to_end"]["status"] == "evaluated":
+                e2e_samples = (
+                    input_data.samples_by_type.get("end_to_end")
+                    or input_data.test_cases
+                )
+                if not e2e_samples:
+                    e2e_samples = self._get_default_test_cases()
+                e2e_result = await self._framework.evaluate(
+                    EvaluationType.END_TO_END,
+                    target_agent=input_data.target_agent,
+                    samples=e2e_samples,
+                )
+                eval_results.append(e2e_result)
+
+            if report.score_coverage["reasoning"]["status"] == "evaluated":
+                reasoning_samples = [
+                    pair
+                    for pair in self._get_reasoning_pairs(input_data)
+                    if pair.get("ground_truth")
+                ]
+                reasoning_result = await self._framework.evaluate(
+                    EvaluationType.REASONING,
+                    target_agent=input_data.target_agent,
+                    samples=reasoning_samples,
+                )
+                eval_results.append(reasoning_result)
+
+            if report.score_coverage["tool_call"]["status"] == "evaluated":
                 tool_result = await self._framework.evaluate(
                     EvaluationType.TOOL_CALL,
                     target_agent=input_data.target_agent,
@@ -319,12 +348,12 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
                 )
                 eval_results.append(tool_result)
 
-            if input_data.eval_type in (EvalType.RAG, EvalType.FULL):
-                report.rag = self._eval_rag(input_data)
+            if report.score_coverage["rag"]["status"] == "evaluated":
                 rag_result = await self._framework.evaluate(
                     EvaluationType.RAG,
                     target_agent=input_data.target_agent,
-                    samples=input_data.samples_by_type.get("rag"),
+                    samples=input_data.samples_by_type.get("rag")
+                    or input_data.test_cases,
                 )
                 eval_results.append(rag_result)
 
@@ -358,12 +387,8 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
                     "avg_score": round(
                         float(np.mean([r.overall_score for r in eval_results])), 4
                     ),
-                    "min_score": round(
-                        min(r.overall_score for r in eval_results), 4
-                    ),
-                    "max_score": round(
-                        max(r.overall_score for r in eval_results), 4
-                    ),
+                    "min_score": round(min(r.overall_score for r in eval_results), 4),
+                    "max_score": round(max(r.overall_score for r in eval_results), 4),
                     "total_evaluations": len(eval_results),
                     "dimensions": {
                         r.evaluation_type.value: round(r.overall_score, 4)
@@ -535,42 +560,45 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
         评估根因分析 Agent 的推理质量。
         """
-        ground_truth = input_data.ground_truth
-        agent_results = input_data.agent_results
-
-        if not ground_truth and not agent_results:
+        reasoning_samples = input_data.samples_by_type.get("reasoning")
+        if (
+            not input_data.ground_truth
+            and not input_data.agent_results
+            and not reasoning_samples
+        ):
             raise ValueError(
                 "Cannot evaluate reasoning: both ground_truth and agent_results are empty. "
                 "Provide real agent_results from a completed incident, or pass ground_truth for offline evaluation."
             )
 
-        # 提取 RCA 结果
-        rca_results = [
-            r for r in agent_results if r.get("agent_name") == "rca_agent"
-        ]
-
-        if not rca_results:
+        pairs = self._get_reasoning_pairs(input_data)
+        if not pairs:
             return ReasoningMetrics()
 
-        # 根因准确率
-        correct_causes = sum(
-            1
-            for r in rca_results
-            if r.get("output_data", {}).get("root_cause")
-            == ground_truth.get("root_cause")
+        # 每个子指标只使用具有该项真值的样本；预测缺失仍是
+        # 有效评测样本的错误输出，不能借“缺预测”逃离分母。
+        root_pairs = [pair for pair in pairs if pair["ground_truth"].get("root_cause")]
+        root_matches = [
+            pair["predicted"].get("root_cause")
+            == pair["ground_truth"].get("root_cause")
+            for pair in root_pairs
+        ]
+        root_cause_acc = (
+            sum(1 for matched in root_matches if matched) / len(root_matches)
+            if root_matches
+            else 0.0
         )
-        root_cause_acc = correct_causes / len(rca_results)
 
         # 置信度校准
         confidences: list[float] = []
         accuracies: list[bool] = []
-        for r in rca_results:
-            conf = r.get("output_data", {}).get("confidence", 0)
+        for pair in root_pairs:
+            conf = pair["predicted"].get("confidence")
             if conf is not None:
                 confidences.append(conf)
                 accuracies.append(
-                    r.get("output_data", {}).get("root_cause")
-                    == ground_truth.get("root_cause")
+                    pair["predicted"].get("root_cause")
+                    == pair["ground_truth"].get("root_cause")
                 )
 
         calibration_error = 0.0
@@ -579,63 +607,84 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             calibration_error = confidence_calibration(confidences, accuracies)
             calibration_score = max(0.0, 1.0 - calibration_error * 3)
 
-        # 影响链评估
-        pred_chain = (
-            rca_results[0].get("output_data", {}).get("impact_chain", [])
-            if rca_results
-            else []
-        )
-        true_chain = ground_truth.get("impact_chain", [])
-        if pred_chain and true_chain:
+        # 影响链评估（按配对样本求平均）
+        impact_scores: list[tuple[float, float, float]] = []
+        for pair in pairs:
+            true_chain = pair["ground_truth"].get("impact_chain", [])
+            if not true_chain:
+                continue
+            pred_chain = pair["predicted"].get("impact_chain", [])
             pred_set = set(pred_chain)
             true_set = set(true_chain)
             intersection = len(pred_set & true_set)
-            precision = intersection / len(pred_set) if pred_set else 0.0
-            recall = intersection / len(true_set) if true_set else 0.0
-            f1 = (
-                2 * precision * recall / (precision + recall)
-                if (precision + recall) > 0
+            sample_precision = intersection / len(pred_set) if pred_set else 0.0
+            sample_recall = intersection / len(true_set) if true_set else 0.0
+            sample_f1 = (
+                2
+                * sample_precision
+                * sample_recall
+                / (sample_precision + sample_recall)
+                if (sample_precision + sample_recall) > 0
                 else 0.0
             )
-        else:
-            precision = recall = f1 = 0.0
-
-        # 建议操作准确率
-        pred_actions = set(
-            rca_results[0].get("output_data", {}).get("suggested_actions", [])
-        ) if rca_results else set()
-        true_actions = set(ground_truth.get("suggested_actions", []))
-        action_acc = (
-            len(pred_actions & true_actions) / len(true_actions)
-            if true_actions
+            impact_scores.append((sample_precision, sample_recall, sample_f1))
+        precision = (
+            float(np.mean([score[0] for score in impact_scores]))
+            if impact_scores
+            else 0.0
+        )
+        recall = (
+            float(np.mean([score[1] for score in impact_scores]))
+            if impact_scores
+            else 0.0
+        )
+        f1 = (
+            float(np.mean([score[2] for score in impact_scores]))
+            if impact_scores
             else 0.0
         )
 
+        # 建议操作准确率
+        action_scores: list[float] = []
+        for pair in pairs:
+            true_actions = set(pair["ground_truth"].get("suggested_actions", []))
+            if not true_actions:
+                continue
+            pred_actions = set(pair["predicted"].get("suggested_actions", []))
+            action_scores.append(len(pred_actions & true_actions) / len(true_actions))
+        action_acc = float(np.mean(action_scores)) if action_scores else 0.0
+
         # 证据完整性
-        pred_evidence = (
-            rca_results[0].get("output_data", {}).get("evidence", {})
-            if rca_results
-            else {}
-        )
-        true_evidence = ground_truth.get("evidence", {})
-        if pred_evidence and true_evidence:
-            from app.evaluation.metrics import evidence_completeness
-            ev_score = evidence_completeness(pred_evidence, true_evidence)
-        else:
-            ev_score = 0.0
+        # predicted 由 _get_reasoning_pairs 严格从
+        # output_data["rca_event"]["evidence"] 取，不接受顶层 evidence。
+        from app.evaluation.metrics import evidence_completeness
+
+        evidence_scores: list[float] = []
+        for pair in pairs:
+            true_evidence = pair["ground_truth"].get("evidence", {})
+            if not true_evidence:
+                continue
+            evidence_scores.append(
+                evidence_completeness(
+                    pair["predicted"].get("evidence", {}), true_evidence
+                )
+            )
+        ev_score = float(np.mean(evidence_scores)) if evidence_scores else 0.0
 
         # 推理链质量
-        pred_steps = (
-            rca_results[0].get("output_data", {}).get("reasoning_steps", [])
-            if rca_results
-            else []
-        )
-        true_steps = ground_truth.get("reasoning_steps", [])
-        if pred_steps and true_steps:
-            from app.evaluation.metrics import reasoning_steps_quality
-            chain_score = reasoning_steps_quality(pred_steps, true_steps)
-        else:
-            chain_score = 0.0
+        from app.evaluation.metrics import reasoning_steps_quality
+
+        chain_scores: list[float] = []
+        for pair in pairs:
+            true_steps = pair["ground_truth"].get("reasoning_steps", [])
+            if not true_steps:
+                continue
+            chain_scores.append(
+                reasoning_steps_quality(
+                    pair["predicted"].get("reasoning_steps", []), true_steps
+                )
+            )
+        chain_score = float(np.mean(chain_scores)) if chain_scores else 0.0
 
         return ReasoningMetrics(
             root_cause_accuracy=round(root_cause_acc, 4),
@@ -647,8 +696,61 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             evidence_completeness=round(ev_score, 4),
             reasoning_chain_quality=round(chain_score, 4),
             suggested_action_accuracy=round(action_acc, 4),
-            mean_confidence=round(float(np.mean(confidences)), 4) if confidences else 0.0,
+            mean_confidence=round(float(np.mean(confidences)), 4)
+            if confidences
+            else 0.0,
         )
+
+    @staticmethod
+    def _prediction_from_rca_result(result: dict[str, Any]) -> dict[str, Any]:
+        """将真实 RCA AgentResult 规范化为 reasoning predicted 样本。"""
+        output = result.get("output_data", {})
+        rca_event = output.get("rca_event", {})
+        return {
+            "root_cause": output.get("root_cause", rca_event.get("root_cause")),
+            "confidence": output.get("confidence", rca_event.get("confidence")),
+            "impact_chain": output.get(
+                "impact_chain", rca_event.get("impact_chain", [])
+            ),
+            "suggested_actions": output.get(
+                "suggested_actions", rca_event.get("recommended_actions", [])
+            ),
+            # S4：真实产物的唯一 evidence 路径。
+            "evidence": rca_event.get("evidence", {}),
+            "reasoning_steps": output.get("reasoning_steps", []),
+        }
+
+    def _get_reasoning_pairs(self, input_data: EvalInput) -> list[dict[str, Any]]:
+        """返回 incident 粒度的 prediction/ground-truth 配对。
+
+        samples_by_type 是 EvalInput 既有字段：
+        dict[str, list[dict[str, Any]]]，default_factory=dict。reasoning 样本
+        形状为 {id, predicted, ground_truth}。无真值样本保留 ground_truth={}
+        以便 coverage 记录 excluded，但不进入任何真值指标分母。
+        """
+        if "reasoning" in input_data.samples_by_type:
+            return [
+                {
+                    "id": sample.get("id", ""),
+                    "predicted": sample.get("predicted", {}),
+                    "ground_truth": sample.get("ground_truth", {}),
+                }
+                for sample in input_data.samples_by_type["reasoning"]
+            ]
+
+        rca_results = [
+            result
+            for result in input_data.agent_results
+            if result.get("agent_name") == "rca_agent"
+        ]
+        return [
+            {
+                "id": result.get("incident_id", input_data.incident_id),
+                "predicted": self._prediction_from_rca_result(result),
+                "ground_truth": input_data.ground_truth,
+            }
+            for result in rca_results
+        ]
 
     # ==================== LLM-as-Judge(D6)====================
 
@@ -945,88 +1047,338 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
     # ==================== 综合评分 ====================
 
+    def _build_score_coverage(
+        self, input_data: EvalInput, report: EvalReport
+    ) -> dict[str, Any]:
+        """构建已评/not_applicable/not_run 三态覆盖明细。"""
+        requested = {
+            "end_to_end": input_data.eval_type in (EvalType.END_TO_END, EvalType.FULL),
+            "reasoning": input_data.eval_type in (EvalType.REASONING, EvalType.FULL),
+            "tool_call": input_data.eval_type in (EvalType.TOOL_CALL, EvalType.FULL),
+            "rag": input_data.eval_type in (EvalType.RAG, EvalType.FULL),
+        }
+
+        def dimension(
+            name: str,
+            metric_values: dict[str, tuple[float, int]],
+            valid_samples: int,
+            excluded_samples: int = 0,
+        ) -> dict[str, Any]:
+            if not requested[name]:
+                status = "not_run"
+            elif any(count > 0 for _, count in metric_values.values()):
+                status = "evaluated"
+            else:
+                status = "not_applicable"
+            return {
+                "status": status,
+                "valid_samples": valid_samples if status == "evaluated" else 0,
+                "excluded_samples": excluded_samples,
+                "score": None,
+                "metrics": {
+                    metric_name: {
+                        "status": (
+                            "not_run"
+                            if not requested[name]
+                            else "evaluated"
+                            if count > 0
+                            else "not_applicable"
+                        ),
+                        "valid_samples": count if requested[name] else 0,
+                        "value": value if requested[name] and count > 0 else None,
+                    }
+                    for metric_name, (value, count) in metric_values.items()
+                },
+            }
+
+        e2e_total = report.end_to_end.total_test_cases if requested["end_to_end"] else 0
+        e2e_metrics = {
+            "task_success_rate": (report.end_to_end.task_success_rate, e2e_total),
+            "detection_accuracy": (report.end_to_end.detection_accuracy, e2e_total),
+            "automation_rate": (report.end_to_end.automation_rate, e2e_total),
+            "false_positive_rate": (report.end_to_end.false_positive_rate, e2e_total),
+        }
+
+        pairs = self._get_reasoning_pairs(input_data) if requested["reasoning"] else []
+        root_count = sum(1 for pair in pairs if pair["ground_truth"].get("root_cause"))
+        calibration_count = sum(
+            1
+            for pair in pairs
+            if pair["ground_truth"].get("root_cause")
+            and pair["predicted"].get("confidence") is not None
+        )
+        impact_count = sum(
+            1 for pair in pairs if pair["ground_truth"].get("impact_chain")
+        )
+        chain_count = sum(
+            1 for pair in pairs if pair["ground_truth"].get("reasoning_steps")
+        )
+        evidence_count = sum(
+            1 for pair in pairs if pair["ground_truth"].get("evidence")
+        )
+        reasoning_valid = sum(
+            1
+            for pair in pairs
+            if any(
+                (
+                    pair["ground_truth"].get("root_cause"),
+                    pair["ground_truth"].get("impact_chain"),
+                    pair["ground_truth"].get("reasoning_steps"),
+                    pair["ground_truth"].get("evidence"),
+                )
+            )
+        )
+        reasoning_metrics = {
+            "root_cause_accuracy": (report.reasoning.root_cause_accuracy, root_count),
+            "confidence_calibration_error": (
+                report.reasoning.confidence_calibration_error,
+                calibration_count,
+            ),
+            "impact_chain_f1": (report.reasoning.impact_chain_f1, impact_count),
+            "reasoning_chain_quality": (
+                report.reasoning.reasoning_chain_quality,
+                chain_count,
+            ),
+            "evidence_completeness": (
+                report.reasoning.evidence_completeness,
+                evidence_count,
+            ),
+        }
+
+        tool_calls = [
+            tool
+            for result in input_data.agent_results
+            for tool in result.get("output_data", {}).get("tools_used", [])
+        ]
+        tool_count = len(tool_calls) if requested["tool_call"] else 0
+        tool_metrics = {
+            "tool_selection_accuracy": (
+                report.tool_call.tool_selection_accuracy,
+                tool_count,
+            ),
+            "parameter_accuracy": (report.tool_call.parameter_accuracy, tool_count),
+            "execution_success_rate": (
+                report.tool_call.execution_success_rate,
+                tool_count,
+            ),
+            "tool_call_efficiency": (report.tool_call.tool_call_efficiency, tool_count),
+        }
+
+        rag_counts = {
+            "retrieval_f1": 0,
+            "answer_faithfulness": 0,
+            "context_relevance": 0,
+            "context_sufficiency": 0,
+        }
+        if requested["rag"]:
+            for case in input_data.test_cases:
+                retrieved = case.get("retrieved_docs", [])
+                relevant = case.get("relevant_docs", [])
+                contexts = [
+                    item.get("content", "") for item in retrieved if item.get("content")
+                ]
+                query = case.get("query", "")
+                answer = case.get("generated_answer", "")
+                if retrieved and relevant:
+                    rag_counts["retrieval_f1"] += 1
+                if answer and contexts:
+                    rag_counts["answer_faithfulness"] += 1
+                if contexts and query:
+                    rag_counts["context_relevance"] += 1
+                    rag_counts["context_sufficiency"] += 1
+        rag_metrics = {
+            "retrieval_f1": (report.rag.retrieval_f1, rag_counts["retrieval_f1"]),
+            "answer_faithfulness": (
+                report.rag.answer_faithfulness,
+                rag_counts["answer_faithfulness"],
+            ),
+            "context_relevance": (
+                report.rag.context_relevance,
+                rag_counts["context_relevance"],
+            ),
+            "context_sufficiency": (
+                report.rag.context_sufficiency,
+                rag_counts["context_sufficiency"],
+            ),
+        }
+        rag_valid = max(rag_counts.values(), default=0)
+
+        return {
+            "end_to_end": dimension("end_to_end", e2e_metrics, e2e_total),
+            "reasoning": dimension(
+                "reasoning",
+                reasoning_metrics,
+                reasoning_valid,
+                excluded_samples=max(0, len(pairs) - reasoning_valid),
+            ),
+            "tool_call": dimension("tool_call", tool_metrics, tool_count),
+            "rag": dimension("rag", rag_metrics, rag_valid),
+        }
+
     def _calculate_overall_score(self, report: EvalReport) -> float:
         """
         计算综合得分
 
         加权平均各维度得分。
         """
-        weights = {
+        dimension_weights = {
             "end_to_end": 0.30,
             "reasoning": 0.30,
             "tool_call": 0.20,
             "rag": 0.20,
         }
+        metric_specs: dict[str, dict[str, tuple[float, float]]] = {
+            "end_to_end": {
+                "task_success_rate": (0.4, report.end_to_end.task_success_rate),
+                "detection_accuracy": (0.3, report.end_to_end.detection_accuracy),
+                "automation_rate": (0.2, report.end_to_end.automation_rate),
+                "false_positive_rate": (0.1, 1 - report.end_to_end.false_positive_rate),
+            },
+            "reasoning": {
+                "root_cause_accuracy": (0.4, report.reasoning.root_cause_accuracy),
+                "confidence_calibration_error": (
+                    0.25,
+                    1 - report.reasoning.confidence_calibration_error,
+                ),
+                "impact_chain_f1": (0.15, report.reasoning.impact_chain_f1),
+                "reasoning_chain_quality": (
+                    0.1,
+                    report.reasoning.reasoning_chain_quality,
+                ),
+                "evidence_completeness": (0.1, report.reasoning.evidence_completeness),
+            },
+            "tool_call": {
+                "tool_selection_accuracy": (
+                    0.35,
+                    report.tool_call.tool_selection_accuracy,
+                ),
+                "parameter_accuracy": (0.25, report.tool_call.parameter_accuracy),
+                "execution_success_rate": (
+                    0.25,
+                    report.tool_call.execution_success_rate,
+                ),
+                "tool_call_efficiency": (0.15, report.tool_call.tool_call_efficiency),
+            },
+            "rag": {
+                "retrieval_f1": (0.35, report.rag.retrieval_f1),
+                "answer_faithfulness": (0.25, report.rag.answer_faithfulness),
+                "context_relevance": (0.2, report.rag.context_relevance),
+                "context_sufficiency": (0.2, report.rag.context_sufficiency),
+            },
+        }
 
-        scores = [
-            weights["end_to_end"]
-            * (
-                report.end_to_end.task_success_rate * 0.4
-                + report.end_to_end.detection_accuracy * 0.3
-                + report.end_to_end.automation_rate * 0.2
-                + (1 - report.end_to_end.false_positive_rate) * 0.1
-            ),
-            weights["reasoning"]
-            * (
-                report.reasoning.root_cause_accuracy * 0.4
-                + (1 - report.reasoning.confidence_calibration_error) * 0.25
-                + report.reasoning.impact_chain_f1 * 0.15
-                + report.reasoning.reasoning_chain_quality * 0.1
-                + report.reasoning.evidence_completeness * 0.1
-            ),
-            weights["tool_call"]
-            * (
-                report.tool_call.tool_selection_accuracy * 0.35
-                + report.tool_call.parameter_accuracy * 0.25
-                + report.tool_call.execution_success_rate * 0.25
-                + report.tool_call.tool_call_efficiency * 0.15
-            ),
-            weights["rag"]
-            * (
-                report.rag.retrieval_f1 * 0.35
-                + report.rag.answer_faithfulness * 0.25
-                + report.rag.context_relevance * 0.2
-                + report.rag.context_sufficiency * 0.2
-            ),
-        ]
+        # 旧单元测试可直接构造 EvalReport，没有输入样本就无法反推
+        # applicability。仅为兼容保留保守推断；process() 路径始终显式填充。
+        coverage = report.score_coverage
+        if not coverage:
+            coverage = {}
+            for dimension_name, specs in metric_specs.items():
+                has_signal = any(
+                    value != 0.0
+                    for metric_name, (_, value) in specs.items()
+                    if metric_name
+                    not in ("false_positive_rate", "confidence_calibration_error")
+                )
+                coverage[dimension_name] = {
+                    "status": "evaluated" if has_signal else "not_applicable",
+                    "score": None,
+                    "metrics": {
+                        name: {
+                            "status": "evaluated" if has_signal else "not_applicable"
+                        }
+                        for name in specs
+                    },
+                }
 
-        return round(sum(scores), 4)
+        weighted_dimensions = 0.0
+        active_dimension_weight = 0.0
+        for dimension_name, specs in metric_specs.items():
+            dimension_coverage = coverage.get(dimension_name, {})
+            if dimension_coverage.get("status") != "evaluated":
+                continue
+            weighted_metrics = 0.0
+            active_metric_weight = 0.0
+            metric_coverage = dimension_coverage.get("metrics", {})
+            for metric_name, (weight, quality) in specs.items():
+                if metric_coverage.get(metric_name, {}).get("status") != "evaluated":
+                    continue
+                weighted_metrics += weight * quality
+                active_metric_weight += weight
+            if active_metric_weight == 0:
+                continue
+            dimension_score = weighted_metrics / active_metric_weight
+            dimension_coverage["score"] = round(dimension_score, 4)
+            weighted_dimensions += dimension_weights[dimension_name] * dimension_score
+            active_dimension_weight += dimension_weights[dimension_name]
+
+        if active_dimension_weight == 0:
+            return 0.0
+        return round(weighted_dimensions / active_dimension_weight, 4)
 
     def _generate_recommendations(self, report: EvalReport) -> list[str]:
         """生成改进建议"""
         recommendations: list[str] = []
 
+        def applicable(dimension: str, metric: str) -> bool:
+            if not report.score_coverage:
+                return True
+            return (
+                report.score_coverage.get(dimension, {})
+                .get("metrics", {})
+                .get(metric, {})
+                .get("status")
+                == "evaluated"
+            )
+
         # 端到端建议
-        if report.end_to_end.task_success_rate < 0.8:
+        if (
+            applicable("end_to_end", "task_success_rate")
+            and report.end_to_end.task_success_rate < 0.8
+        ):
             recommendations.append(
                 f"[End-to-End] Task success rate ({report.end_to_end.task_success_rate:.1%}) "
                 f"is below target (80%). Consider improving playbook coverage, "
                 f"enhancing error handling, and adding more self-healing scenarios."
             )
-        if report.end_to_end.false_positive_rate > 0.1:
+        if (
+            applicable("end_to_end", "false_positive_rate")
+            and report.end_to_end.false_positive_rate > 0.1
+        ):
             recommendations.append(
                 f"[End-to-End] False positive rate ({report.end_to_end.false_positive_rate:.1%}) "
                 f"is high. Review anomaly detection thresholds and tune sensitivity."
             )
-        if report.end_to_end.automation_rate < 0.6:
+        if (
+            applicable("end_to_end", "automation_rate")
+            and report.end_to_end.automation_rate < 0.6
+        ):
             recommendations.append(
                 f"[End-to-End] Automation rate ({report.end_to_end.automation_rate:.1%}) "
                 f"is low. Review manual intervention points and automate common recovery."
             )
 
         # 推理建议
-        if report.reasoning.root_cause_accuracy < 0.7:
+        if (
+            applicable("reasoning", "root_cause_accuracy")
+            and report.reasoning.root_cause_accuracy < 0.7
+        ):
             recommendations.append(
                 f"[Reasoning] Root cause accuracy ({report.reasoning.root_cause_accuracy:.1%}) "
                 f"needs improvement. Expand knowledge base and refine Bayesian priors."
             )
-        if report.reasoning.confidence_calibration_error > 0.2:
+        if (
+            applicable("reasoning", "confidence_calibration_error")
+            and report.reasoning.confidence_calibration_error > 0.2
+        ):
             recommendations.append(
                 f"[Reasoning] Confidence calibration error "
                 f"({report.reasoning.confidence_calibration_error:.2f}) "
                 f"is significant. Implement temperature scaling for calibration."
             )
-        if report.reasoning.reasoning_chain_quality < 0.6:
+        if (
+            applicable("reasoning", "reasoning_chain_quality")
+            and report.reasoning.reasoning_chain_quality < 0.6
+        ):
             recommendations.append(
                 f"[Reasoning] Reasoning chain quality "
                 f"({report.reasoning.reasoning_chain_quality:.1%}) "
@@ -1034,13 +1386,19 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             )
 
         # 工具调用建议
-        if report.tool_call.tool_selection_accuracy < 0.8:
+        if (
+            applicable("tool_call", "tool_selection_accuracy")
+            and report.tool_call.tool_selection_accuracy < 0.8
+        ):
             recommendations.append(
                 f"[Tool Call] Tool selection accuracy "
                 f"({report.tool_call.tool_selection_accuracy:.1%}) "
                 f"can be improved. Add more training examples for tool selection."
             )
-        if report.tool_call.parameter_accuracy < 0.8:
+        if (
+            applicable("tool_call", "parameter_accuracy")
+            and report.tool_call.parameter_accuracy < 0.8
+        ):
             recommendations.append(
                 f"[Tool Call] Parameter accuracy ({report.tool_call.parameter_accuracy:.1%}) "
                 f"needs work. Improve parameter schema understanding."
@@ -1053,26 +1411,38 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             )
 
         # RAG 建议
-        if report.rag.retrieval_precision < 0.7:
+        if applicable("rag", "retrieval_f1") and report.rag.retrieval_precision < 0.7:
             recommendations.append(
                 f"[RAG] Retrieval precision ({report.rag.retrieval_precision:.1%}) "
                 f"is low. Consider using better embedding models or adding metadata."
             )
-        if report.rag.retrieval_recall < 0.6:
+        if applicable("rag", "retrieval_f1") and report.rag.retrieval_recall < 0.6:
             recommendations.append(
                 f"[RAG] Retrieval recall ({report.rag.retrieval_recall:.1%}) "
                 f"is low. Increase top-k values or use hybrid search."
             )
-        if report.rag.answer_faithfulness < 0.7:
+        if (
+            applicable("rag", "answer_faithfulness")
+            and report.rag.answer_faithfulness < 0.7
+        ):
             recommendations.append(
                 f"[RAG] Answer faithfulness ({report.rag.answer_faithfulness:.1%}) "
                 f"needs improvement. Implement groundedness checks."
             )
 
         if not recommendations:
-            recommendations.append(
-                "All metrics are within acceptable ranges. System is performing well."
+            has_evaluated_dimension = any(
+                coverage.get("status") == "evaluated"
+                for coverage in report.score_coverage.values()
             )
+            if report.score_coverage and not has_evaluated_dimension:
+                recommendations.append(
+                    "No applicable evaluation samples were available; metrics are N/A."
+                )
+            else:
+                recommendations.append(
+                    "All metrics are within acceptable ranges. System is performing well."
+                )
 
         return recommendations
 
