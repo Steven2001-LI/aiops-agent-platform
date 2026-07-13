@@ -49,7 +49,7 @@ from app.models.incident import Incident, IncidentState
 from app.models.memory import MemoryType
 from app.nlu.hybrid import hybrid_understand
 from app.nlu.metric_mapper import MetricMapper
-from app.services.incident_service import IncidentService
+from app.services.incident_service import get_incident_service
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -57,7 +57,7 @@ logger = get_logger(__name__)
 api_router = APIRouter(prefix="/api/v1")
 
 # 全局服务实例（模块级别单例）
-_incident_service = IncidentService()
+_incident_service = get_incident_service()
 _monitor_agent: MonitorAgent | None = None
 _rca_agent: RCAAgent | None = None
 _heal_agent: HealAgent | None = None
@@ -503,6 +503,15 @@ async def _process_incident_pipeline(incident: Incident) -> None:
         monitor_result = await monitor.execute(metric_input, ctx)
         logger.info("Monitor agent completed", success=monitor_result.success)
 
+        if not monitor_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="monitor",
+                error_message=monitor_result.error_message or "Monitor agent returned an unsuccessful result",
+                actor="monitor_agent",
+            )
+            return
+
         # → 记忆：存储异常检测结果
         if monitor_result.success and monitor_result.output_data:
             detection = monitor_result.output_data.get("detection_result", {})
@@ -545,6 +554,15 @@ async def _process_incident_pipeline(incident: Incident) -> None:
         )
         rca_result = await rca.execute(rca_input, ctx)
 
+        if not rca_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="rca",
+                error_message=rca_result.error_message or "RCA agent returned an unsuccessful result",
+                actor="rca_agent",
+            )
+            return
+
         rca_event: RCAEvent | None = None
         if rca_result.output_data:
             rca_event_dict = rca_result.output_data.get("rca_event", {})
@@ -556,6 +574,15 @@ async def _process_incident_pipeline(incident: Incident) -> None:
                 incident.context["rca_confidence"] = rca_result.output_data.get("confidence", 0)
                 incident.context["rca_impact_count"] = rca_result.output_data.get("impact_services_count", 0)
                 incident.context["rca_suggested_actions"] = rca_result.output_data.get("suggested_actions", [])
+
+        if rca_event is None:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="rca",
+                error_message="RCA agent succeeded without a valid rca_event",
+                actor="rca_agent",
+            )
+            return
 
         incident.transition_to(IncidentState.RCA_COMPLETED, actor="rca_agent")
         await _broadcast_incident(incident)
@@ -596,11 +623,29 @@ async def _process_incident_pipeline(incident: Incident) -> None:
 
         heal = _get_heal()
         heal_input = HealInput(
-            rca_event=rca_event or RCAEvent(incident_id=incident.incident_id),
+            rca_event=rca_event,
             incident_id=incident.incident_id,
             dry_run=True,
         )
         heal_result = await heal.execute(heal_input, ctx)
+
+        if not heal_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="heal",
+                error_message=heal_result.error_message or "Heal agent returned an unsuccessful result",
+                actor="heal_agent",
+            )
+            return
+
+        if heal_result.output_data.get("dry_run_passed") is not True:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="heal",
+                error_message="Heal dry-run validation did not pass",
+                actor="heal_agent",
+            )
+            return
 
         heal_event: HealEvent | None = None
         if heal_result.output_data:
@@ -611,6 +656,15 @@ async def _process_incident_pipeline(incident: Incident) -> None:
                 incident.context["heal_action"] = heal_result.output_data.get("action", "")
                 incident.context["heal_level"] = heal_result.output_data.get("level", "L0")
                 incident.context["heal_blast_radius"] = heal_result.output_data.get("blast_radius", 0)
+
+        if heal_event is None:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="heal",
+                error_message="Heal agent succeeded without a valid heal_event",
+                actor="heal_agent",
+            )
+            return
 
         logger.info("Heal agent completed", success=heal_result.success)
 
@@ -651,13 +705,23 @@ async def _process_incident_pipeline(incident: Incident) -> None:
 
         change = _get_change()
         change_input = ChangeInput(
-            heal_event=heal_event or HealEvent(incident_id=incident.incident_id),
+            heal_event=heal_event,
             incident_id=incident.incident_id,
             change_type="auto_heal",
             requester="orchestrator",
         )
         change_result = await change.execute(change_input, ctx)
 
+        if not change_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="change",
+                error_message=change_result.error_message or "Change agent returned an unsuccessful result",
+                actor="change_agent",
+            )
+            return
+
+        change_event: ChangeEvent | None = None
         if change_result.output_data:
             change_event_dict = change_result.output_data.get("change_event", {})
             if change_event_dict:
@@ -665,6 +729,15 @@ async def _process_incident_pipeline(incident: Incident) -> None:
                 incident.change_events.append(change_event)
                 incident.context["approval_status"] = change_result.output_data.get("approval_status", "pending")
                 incident.context["risk_score"] = change_result.output_data.get("risk_score", 0)
+
+        if change_event is None:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="change",
+                error_message="Change agent succeeded without a valid change_event",
+                actor="change_agent",
+            )
+            return
 
         logger.info("Change agent completed", success=change_result.success)
 
@@ -687,7 +760,27 @@ async def _process_incident_pipeline(incident: Incident) -> None:
                 tags=["change", "approval", incident.service, risk_level],
             )
 
+        approval_status = change_result.output_data.get("approval_status", "")
+        if approval_status == "pending":
+            await _broadcast_incident(incident)
+            logger.info(
+                "Incident pipeline paused for approval",
+                incident_id=incident.incident_id,
+                approval_status=approval_status,
+            )
+            return
+
+        if approval_status not in {"approved", "auto_approved"}:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="change",
+                error_message=f"Change approval did not permit resolution: {approval_status or 'missing'}",
+                actor="change_agent",
+            )
+            return
+
         # ── Step 5: 完成 → 归档工作记忆到长期记忆 ──
+        incident.context["resolution_mode"] = "simulated"
         incident.transition_to(IncidentState.RESOLVED, actor="orchestrator")
         await _broadcast_incident(incident)
         logger.info("Incident pipeline completed", incident_id=incident.incident_id)
@@ -709,8 +802,39 @@ async def _process_incident_pipeline(incident: Incident) -> None:
             error=str(e),
             traceback=traceback.format_exc(),
         )
-        incident.transition_to(IncidentState.ESCALATED, actor="orchestrator")
-        await _broadcast_incident(incident)
+        await _escalate_pipeline_failure(
+            incident,
+            stage="pipeline",
+            error_message=str(e),
+            actor="orchestrator",
+        )
+
+
+async def _escalate_pipeline_failure(
+    incident: Incident,
+    *,
+    stage: str,
+    error_message: str,
+    actor: str,
+) -> None:
+    """将核心管道失败记录为可观测的人工升级终态。"""
+    logger.error(
+        "Incident pipeline stage failed",
+        incident_id=incident.incident_id,
+        stage=stage,
+        error=error_message,
+    )
+    incident.context["pipeline_failure"] = {
+        "stage": stage,
+        "error": error_message,
+    }
+    incident.transition_to(IncidentState.ESCALATED, actor=actor)
+    if incident.timeline:
+        incident.timeline[-1].details.update({
+            "failure_stage": stage,
+            "error": error_message,
+        })
+    await _broadcast_incident(incident)
 
 
 def _get_metric(incident: Incident) -> str:

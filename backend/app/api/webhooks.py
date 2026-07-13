@@ -16,10 +16,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 
-from app.models.events import AlertEvent, SeverityLevel
+from app.models.events import AlertEvent, ChangeEvent, HealEvent, RCAEvent, SeverityLevel
 from app.models.incident import Incident, IncidentState
 from app.models.memory import MemoryType
-from app.services.incident_service import IncidentService
+from app.services.incident_service import get_incident_service
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 webhook_router = APIRouter(prefix="/api/v1/webhooks", tags=["Webhooks"])
 
 # 全局 IncidentService（与 routes.py 共享存储）
-_incident_service = IncidentService()
+_incident_service = get_incident_service()
 
 
 # =============================================================================
@@ -85,17 +85,12 @@ async def _store_wm(incident_id: str, key: str, value: Any) -> None:
 # =============================================================================
 
 async def _run_agent_pipeline(incident: Incident) -> None:
-    """
-    执行 Agent 处理管道，每步完成后存入记忆系统。
-
-    与 routes.py 中的 _process_incident_pipeline 逻辑一致。
-    """
+    """执行带统一超时包装和真实失败门禁的 webhook Agent 管道。"""
     from app.agents.base import AgentExecutionContext
     from app.agents.change_agent import ChangeAgent, ChangeInput
     from app.agents.heal_agent import HealAgent, HealInput
     from app.agents.monitor_agent import MetricInput, MonitorAgent
     from app.agents.rca_agent import RCAAgent, RCAInput
-    from app.api.websocket import manager as ws_manager
 
     ctx = AgentExecutionContext(
         incident_id=incident.incident_id,
@@ -104,7 +99,13 @@ async def _run_agent_pipeline(incident: Incident) -> None:
 
     try:
         alert = incident.alert_event
-        if not alert:
+        if alert is None:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="monitor",
+                error_message="Webhook incident has no alert_event",
+                actor="webhook",
+            )
             return
 
         # Step 1: Monitor
@@ -116,14 +117,20 @@ async def _run_agent_pipeline(incident: Incident) -> None:
             labels=alert.labels,
         )
         incident.transition_to(IncidentState.ANALYZING, actor="webhook")
-        monitor_result = await monitor.process(metric, ctx)
+        monitor_result = await monitor.execute(metric, ctx)
+        if not monitor_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="monitor",
+                error_message=monitor_result.error_message or "Monitor agent returned an unsuccessful result",
+                actor="monitor_agent",
+            )
+            return
 
-        # → 记忆：异常检测结果
         await _store_memory(
             content=(
                 f"[MonitorAgent] {alert.service} {alert.metric}={alert.value}. "
-                f"Severity: {alert.severity.value}. "
-                f"Source: alertmanager-webhook."
+                f"Severity: {alert.severity.value}. Source: alertmanager-webhook."
             ),
             agent_name="monitor_agent",
             incident_id=incident.incident_id,
@@ -135,91 +142,193 @@ async def _run_agent_pipeline(incident: Incident) -> None:
         # Step 2: RCA
         incident.transition_to(IncidentState.RCA_IN_PROGRESS, actor="webhook")
         rca = RCAAgent()
-        rca_input = RCAInput(alert=alert, incident_id=incident.incident_id)
-        rca_result = await rca.process(rca_input, ctx)
-
-        # → 记忆：根因分析
-        if rca_result.success:
-            root_cause = rca_result.output_data.get("root_cause", "unknown")
-            await _store_memory(
-                content=(
-                    f"[RCAAgent] Root cause: {root_cause}. "
-                    f"Confidence: {rca_result.output_data.get('confidence', 0):.2f}. "
-                    f"Impact: {rca_result.output_data.get('impact_services_count', 0)} services."
-                ),
-                agent_name="rca_agent",
-                incident_id=incident.incident_id,
-                importance=0.85,
-                memory_type=MemoryType.EPISODIC,
-                tags=["rca", "root_cause", alert.service],
+        rca_result = await rca.execute(
+            RCAInput(alert=alert, incident_id=incident.incident_id),
+            ctx,
+        )
+        if not rca_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="rca",
+                error_message=rca_result.error_message or "RCA agent returned an unsuccessful result",
+                actor="rca_agent",
             )
-            await _store_wm(incident.incident_id, "rca.result", {
-                "root_cause": root_cause,
-                "confidence": rca_result.output_data.get("confidence", 0),
-            })
+            return
+
+        rca_event_data = rca_result.output_data.get("rca_event", {})
+        if not rca_event_data:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="rca",
+                error_message="RCA agent succeeded without a valid rca_event",
+                actor="rca_agent",
+            )
+            return
+        rca_event = RCAEvent(**rca_event_data) if isinstance(rca_event_data, dict) else rca_event_data
+        incident.rca_event = rca_event
+        incident.transition_to(IncidentState.RCA_COMPLETED, actor="webhook")
+
+        root_cause = rca_result.output_data.get("root_cause", "unknown")
+        await _store_memory(
+            content=(
+                f"[RCAAgent] Root cause: {root_cause}. "
+                f"Confidence: {rca_result.output_data.get('confidence', 0):.2f}. "
+                f"Impact: {rca_result.output_data.get('impact_services_count', 0)} services."
+            ),
+            agent_name="rca_agent",
+            incident_id=incident.incident_id,
+            importance=0.85,
+            memory_type=MemoryType.EPISODIC,
+            tags=["rca", "root_cause", alert.service],
+        )
+        await _store_wm(incident.incident_id, "rca.result", {
+            "root_cause": root_cause,
+            "confidence": rca_result.output_data.get("confidence", 0),
+        })
 
         # Step 3: Heal
-        if rca_result.success:
-            from app.models.events import RCAEvent
-            rca_event_data = rca_result.output_data.get("rca_event", {})
-            rca_event = RCAEvent(**rca_event_data) if rca_event_data else None
-            if rca_event:
-                incident.transition_to(IncidentState.HEALING, actor="webhook")
-                heal = HealAgent()
-                heal_input = HealInput(rca_event=rca_event, incident_id=incident.incident_id)
-                heal_result = await heal.process(heal_input, ctx)
+        incident.transition_to(IncidentState.HEALING, actor="webhook")
+        heal = HealAgent()
+        heal_result = await heal.execute(
+            HealInput(
+                rca_event=rca_event,
+                incident_id=incident.incident_id,
+                dry_run=True,
+            ),
+            ctx,
+        )
+        if not heal_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="heal",
+                error_message=heal_result.error_message or "Heal agent returned an unsuccessful result",
+                actor="heal_agent",
+            )
+            return
+        if heal_result.output_data.get("dry_run_passed") is not True:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="heal",
+                error_message="Heal dry-run validation did not pass",
+                actor="heal_agent",
+            )
+            return
 
-                # → 记忆：自愈方案
-                if heal_result.success:
-                    await _store_memory(
-                        content=(
-                            f"[HealAgent] Playbook: {heal_result.output_data.get('playbook_matched', 'none')}. "
-                            f"Level: {heal_result.output_data.get('heal_level', 'L0')}. "
-                            f"Actions: {heal_result.output_data.get('actions_count', 0)}."
-                        ),
-                        agent_name="heal_agent",
-                        incident_id=incident.incident_id,
-                        importance=0.7,
-                        memory_type=MemoryType.PROCEDURAL,
-                        tags=["heal", "playbook", alert.service],
-                    )
+        heal_event_data = heal_result.output_data.get("heal_event", {})
+        if not heal_event_data:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="heal",
+                error_message="Heal agent succeeded without a valid heal_event",
+                actor="heal_agent",
+            )
+            return
+        heal_event = HealEvent(**heal_event_data) if isinstance(heal_event_data, dict) else heal_event_data
+        incident.heal_events.append(heal_event)
 
-                # Step 4: Change
-                if heal_result.success:
-                    from app.models.events import HealEvent
-                    heal_event_data = heal_result.output_data.get("heal_event", {})
-                    heal_event = HealEvent(**heal_event_data) if heal_event_data else None
-                    if heal_event:
-                        incident.transition_to(IncidentState.AWAITING_APPROVAL, actor="webhook")
-                        change = ChangeAgent()
-                        change_input = ChangeInput(heal_event=heal_event, incident_id=incident.incident_id)
-                        change_result = await change.process(change_input, ctx)
+        await _store_memory(
+            content=(
+                f"[HealAgent] Playbook: {heal_result.output_data.get('playbook_matched', 'none')}. "
+                f"Level: {heal_result.output_data.get('heal_level', 'L0')}. "
+                f"Actions: {heal_result.output_data.get('actions_count', 0)}."
+            ),
+            agent_name="heal_agent",
+            incident_id=incident.incident_id,
+            importance=0.7,
+            memory_type=MemoryType.PROCEDURAL,
+            tags=["heal", "playbook", alert.service],
+        )
 
-                        # → 记忆：审批决策
-                        if change_result.success:
-                            await _store_memory(
-                                content=(
-                                    f"[ChangeAgent] Risk: {change_result.output_data.get('risk_score', 0):.3f} "
-                                    f"({change_result.output_data.get('risk_level', 'low')}). "
-                                    f"Approval: {change_result.output_data.get('approval_status', 'pending')}."
-                                ),
-                                agent_name="change_agent",
-                                incident_id=incident.incident_id,
-                                importance=0.6,
-                                memory_type=MemoryType.EPISODIC,
-                                tags=["change", "approval", alert.service],
-                            )
+        # Step 4: Change
+        incident.transition_to(IncidentState.AWAITING_APPROVAL, actor="webhook")
+        change = ChangeAgent()
+        change_result = await change.execute(
+            ChangeInput(heal_event=heal_event, incident_id=incident.incident_id),
+            ctx,
+        )
+        if not change_result.success:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="change",
+                error_message=change_result.error_message or "Change agent returned an unsuccessful result",
+                actor="change_agent",
+            )
+            return
 
+        change_event_data = change_result.output_data.get("change_event", {})
+        if not change_event_data:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="change",
+                error_message="Change agent succeeded without a valid change_event",
+                actor="change_agent",
+            )
+            return
+        change_event = (
+            ChangeEvent(**change_event_data)
+            if isinstance(change_event_data, dict)
+            else change_event_data
+        )
+        incident.change_events.append(change_event)
+        approval_status = change_result.output_data.get("approval_status", "")
+        incident.context["approval_status"] = approval_status
+        incident.context["risk_score"] = change_result.output_data.get("risk_score", 0)
+
+        await _store_memory(
+            content=(
+                f"[ChangeAgent] Risk: {change_result.output_data.get('risk_score', 0):.3f} "
+                f"({change_result.output_data.get('risk_level', 'low')}). "
+                f"Approval: {approval_status or 'missing'}."
+            ),
+            agent_name="change_agent",
+            incident_id=incident.incident_id,
+            importance=0.6,
+            memory_type=MemoryType.EPISODIC,
+            tags=["change", "approval", alert.service],
+        )
+
+        if approval_status == "pending":
+            await _broadcast_incident_state(incident)
+            logger.info(
+                "Webhook pipeline paused for approval",
+                incident_id=incident.incident_id,
+            )
+            return
+        if approval_status not in {"approved", "auto_approved"}:
+            await _escalate_pipeline_failure(
+                incident,
+                stage="change",
+                error_message=f"Change approval did not permit resolution: {approval_status or 'missing'}",
+                actor="change_agent",
+            )
+            return
+
+        # Step 5: 只在审批通过后标注模拟完成并归档
+        incident.context["resolution_mode"] = "simulated"
         incident.transition_to(IncidentState.RESOLVED, actor="webhook")
-
-        # → 归档工作记忆
         try:
             ms = await _get_ms()
             if ms is not None:
                 await ms.flow_wm_to_ltm(incident.incident_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to archive webhook working memory", error=str(e))
+        await _broadcast_incident_state(incident)
 
+    except Exception as e:
+        logger.error("Webhook pipeline error", incident_id=incident.incident_id, error=str(e))
+        await _escalate_pipeline_failure(
+            incident,
+            stage="pipeline",
+            error_message=str(e),
+            actor="webhook-error",
+        )
+
+
+async def _broadcast_incident_state(incident: Incident) -> None:
+    """广播 webhook 管道的最新状态，广播失败不改变业务终态。"""
+    from app.api.websocket import manager as ws_manager
+
+    try:
         await ws_manager.broadcast({
             "type": "incident_update",
             "payload": {
@@ -229,10 +338,35 @@ async def _run_agent_pipeline(incident: Incident) -> None:
             },
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-
     except Exception as e:
-        logger.error("Webhook pipeline error", incident_id=incident.incident_id, error=str(e))
-        incident.transition_to(IncidentState.ESCALATED, actor="webhook-error")
+        logger.error("Webhook WebSocket broadcast failed", error=str(e))
+
+
+async def _escalate_pipeline_failure(
+    incident: Incident,
+    *,
+    stage: str,
+    error_message: str,
+    actor: str,
+) -> None:
+    """将 webhook 核心管道失败记录为可观测的人工升级终态。"""
+    logger.error(
+        "Webhook pipeline stage failed",
+        incident_id=incident.incident_id,
+        stage=stage,
+        error=error_message,
+    )
+    incident.context["pipeline_failure"] = {
+        "stage": stage,
+        "error": error_message,
+    }
+    incident.transition_to(IncidentState.ESCALATED, actor=actor)
+    if incident.timeline:
+        incident.timeline[-1].details.update({
+            "failure_stage": stage,
+            "error": error_message,
+        })
+    await _broadcast_incident_state(incident)
 
 
 # =============================================================================

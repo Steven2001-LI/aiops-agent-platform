@@ -191,3 +191,11 @@ class IncidentService:
 
         incident.metrics = metrics
         return True
+
+
+_shared_incident_service = IncidentService()
+
+
+def get_incident_service() -> IncidentService:
+    """获取进程内共享的故障服务实例。"""
+    return _shared_incident_service
