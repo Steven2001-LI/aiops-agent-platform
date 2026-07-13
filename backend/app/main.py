@@ -21,6 +21,7 @@ from app.api.webhooks import webhook_router
 from app.api.websocket import websocket_router
 from app.config import get_config
 from app.infrastructure import InfrastructureRegistry
+from app.services.langfuse_service import get_langfuse_service
 from app.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -76,6 +77,11 @@ async def lifespan(app: FastAPI):
         app.state.orchestrator = None
         app.state.langgraph_available = False
 
+    try:
+        await get_langfuse_service().initialize()
+    except Exception as e:
+        logger.warning("Langfuse init failed, continuing without tracing", error=str(e))
+
     logger.info(
         "Startup complete",
         chromadb=infra_status.get("chromadb", False),
@@ -90,6 +96,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("AIOps Agent Platform shutting down")
     await infra.close()
+    get_langfuse_service().shutdown()
     logger.info("AIOps Agent Platform shutdown complete")
 
 
