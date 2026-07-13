@@ -89,3 +89,6 @@ docs/*-task*.md
 docs/*-review*.md
 docs/*-plan*.md
 docs/d7-benchmark*.md
+
+# 面试素材截图(Langfuse trace / 评测面板等),含账号/项目信息,不入公开历史
+docs/screenshots/
