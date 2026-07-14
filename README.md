@@ -1,525 +1,209 @@
 # AIOps Agent Platform
 
-多智能体智能化运维故障定位系统 - 使用 Python + FastAPI + LangGraph 构建。
+一个**受控模拟环境下的多 Agent 故障诊断原型**：接收告警或自然语言故障描述，由多个专业 Agent 协作完成异常检测、混合根因分析、Dry-Run 恢复规划、风险审批与记忆归档，并附带一套候选评测（Candidate Evaluation）框架。
 
-## 项目概述
+> 这是一个技术演示项目，不是生产自愈系统。所有"修复"均为 Dry-Run 模拟，基础设施数据来自内置的模拟数据集。
 
-AIOps Agent Platform 是一个基于多智能体架构的智能化运维故障定位系统。系统通过多个
-专业 Agent 协作，实现从告警接收、根因分析到故障自愈的全流程自动化处理。
+## 30 秒了解这个项目
 
-### 核心架构
+| 问题 | 回答 |
+|------|------|
+| 解决什么问题 | 演示"告警 → 根因 → 恢复方案 → 审批 → 经验沉淀"这条 AIOps 诊断链路如何用多 Agent + 规则/LLM 混合推理实现 |
+| 输入是什么 | 结构化告警事件（`POST /api/v1/incidents/trigger`），或自然语言故障描述（`POST /api/v1/incidents/diagnose`，如"为什么下单这么慢？"） |
+| Agent 做什么 | Monitor 多算法投票检测异常 → RCA 融合拓扑/贝叶斯/知识库/历史记忆定位根因 → Heal 匹配 Playbook 并做 Dry-Run 与爆炸半径评估 → Change 五因素风险评分决定自动批准或挂起等待人工 |
+| 输出是什么 | 故障状态机全程流转记录（WebSocket 实时推送）：根因假设与置信度、Dry-Run 恢复计划、风险评分与审批结论、归档到记忆系统的诊断经验 |
+| 边界在哪 | 受控模拟原型：不触碰真实基础设施、不执行真实修复；LLM 是可选增强，默认走纯规则路径 |
 
+## 两条真实执行路径
+
+代码中存在两条独立的编排路径，请勿混淆：
+
+1. **HTTP Demo Pipeline（当前 API 的实际执行器）**：`POST /api/v1/incidents/trigger` 触发的是 [`routes.py`](backend/app/api/routes.py) 中手写的顺序管道 `_process_incident_pipeline`——Monitor → RCA → Heal(Dry-Run) → Change 依次执行，任一阶段失败转人工升级（ESCALATED），审批 `pending` 则暂停流程（当前没有完整的审批恢复执行 API）。
+2. **独立 LangGraph 状态机（演示路径）**：[`orchestrator.py`](backend/app/agents/orchestrator.py) 用 LangGraph 构建了同语义的条件路由状态机（含人工升级、pending 暂停终态、模拟解决），应用启动时会真实构建，可通过 `Orchestrator.process_alert()` 执行，有独立测试覆盖——但它**不是**当前 HTTP 请求的执行器。
+
+## 架构图
+
+```mermaid
+flowchart TB
+    subgraph HTTP["HTTP Demo Pipeline（当前 API 实际执行路径，手写顺序管道）"]
+        A[Incident 告警触发] --> M[Monitor Agent<br/>多算法投票异常检测]
+        M --> R[RCA Agent<br/>混合根因分析]
+        R --> H[Heal Agent<br/>Playbook 匹配 + Dry-Run]
+        H --> C[Change Agent<br/>风险评分 / 审批门控]
+        C -->|approved / auto_approved| S[模拟解决 + 记忆归档]
+        C -->|pending| P[暂停等待审批]
+        M & R & H & C -->|任一阶段失败| E[人工升级 ESCALATED]
+        S --> EV[Eval Agent<br/>Candidate Evaluation]
+    end
+
+    subgraph LG["Independent LangGraph State Machine（独立演示路径，非 HTTP 执行器）"]
+        GS[Shared GraphState] --> CR[Conditional Routing<br/>decide_action / after_heal / after_approval]
+        CR -->|失败| HE[Human Escalation]
+        CR -->|审批通过| SR[Simulated Resolution]
+        CR -->|pending| PE[合法暂停终态]
+    end
 ```
-                    +------------------+
-                    |   Alert Source   |
-                    | (Prometheus/...) |
-                    +--------+---------+
-                             |
-                             v
-+--------------------------------------------------+
-|              Orchestrator (LangGraph)             |
-|  [receive_alert] -> [triage] -> [rca] -> [heal] |
-+--+-----------+-----------+-----------+-----------+
-   |           |           |           |
-   v           v           v           v
-+------+  +--------+  +---------+  +---------+
-|Monitor|  |  RCA   |  |  Heal   |  | Change |
-| Agent |  | Agent  |  | Agent   |  | Agent  |
-+-------+  +--------+  +---------+  +---------+
-                             |
-                             v
-                    +------------------+
-                    |  Memory Agent    |
-                    |  Eval Agent      |
-                    +------------------+
+
+## 核心技术亮点与代码入口
+
+| 技术点 | 实现要点 | 代码入口 |
+|--------|----------|----------|
+| Agent 统一执行包装 | 泛型 `BaseAgent[TInput, TOutput]`，`asyncio.wait_for` 超时控制，统一成功/失败/超时语义与状态记录 | [`backend/app/agents/base.py`](backend/app/agents/base.py) |
+| 多算法异常检测 | 3-Sigma / EWMA / sklearn Isolation Forest 三算法投票共识，训练样本不足时回退 MAD；告警指纹去重 | [`backend/app/agents/monitor_agent.py`](backend/app/agents/monitor_agent.py) |
+| 混合根因分析 | BFS 拓扑依赖遍历 + 贝叶斯后验推理 + 知识库检索 + 历史记忆，多路证据融合 | [`backend/app/agents/rca_agent.py`](backend/app/agents/rca_agent.py) |
+| LLM 结构化输出约束 | `structured_completion`：Pydantic Schema 校验 + 闭集候选校验回调，校验失败把错误喂回模型自修复重试，耗尽抛 `LLMUnavailableError` | [`backend/app/services/llm_service.py`](backend/app/services/llm_service.py) |
+| LLM 不可用规则降级 | RCA / NLU / Judge 三处各自闭环降级到规则路径，`LLMUnavailableError` 不冒泡到 API 层 | [`backend/app/agents/rca_agent.py`](backend/app/agents/rca_agent.py) · [`backend/app/nlu/hybrid.py`](backend/app/nlu/hybrid.py) |
+| Dry-Run 恢复规划 | Playbook 匹配、逐动作 Dry-Run 模拟、爆炸半径评估、L0/L1/L2 分级自愈、熔断器保护 | [`backend/app/agents/heal_agent.py`](backend/app/agents/heal_agent.py) |
+| 风险评分与审批门控 | 五因素加权风险评分（爆炸半径/历史成功率/时间因素/服务等级/变更类型），分级审批与审计日志 | [`backend/app/agents/change_agent.py`](backend/app/agents/change_agent.py) |
+| LangGraph 条件状态机 | `StateGraph` + 条件边路由：失败升级 / pending 暂停 / 审批通过验证，终态与 incident 状态一致性校验 | [`backend/app/agents/orchestrator.py`](backend/app/agents/orchestrator.py) |
+| 三层记忆系统 | 短期/长期/工作记忆流转与归档，ChromaDB 本地持久化向量检索 | [`backend/app/memory/core.py`](backend/app/memory/core.py) |
+| Candidate Evaluation | 端到端/推理/工具调用/RAG 四维度规则指标，可选 LLM-as-Judge 融合（规则分 0.6 + Judge 分 0.4） | [`backend/app/agents/eval_agent.py`](backend/app/agents/eval_agent.py) |
+| NLU 快慢路径 | 正则快路径 + LLM 慢路径（置信度阈值切换），自然语言 → 意图/实体/诊断计划 | [`backend/app/nlu/hybrid.py`](backend/app/nlu/hybrid.py) |
+
+## 最小演示流程
+
+以本地开发模式启动后端后（见下文 Local verification）：
+
+```bash
+# 1. 触发一次结构化告警，走完整 Agent 管道
+curl -X POST http://localhost:8000/api/v1/incidents/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"source":"demo","service":"order-service","metric":"cpu_usage_percent","value":95.0,"threshold":80.0,"operator":">","severity":"critical"}'
+
+# 2. 用返回的 incident_id 查询处理进度（管道在后台异步执行）
+curl http://localhost:8000/api/v1/incidents/<incident_id>
+
+# 3. 或者用自然语言触发诊断
+curl -X POST http://localhost:8000/api/v1/incidents/diagnose \
+  -H "Content-Type: application/json" \
+  -d '{"query":"为什么下单这么慢？"}'
 ```
 
-### Agent 职责
+处理结果包含根因假设、Dry-Run 恢复计划、风险评分与审批状态；WebSocket 同步推送状态流转。
 
-| Agent | 职责 |
-|-------|------|
-| **Monitor Agent** | 告警接收、去重、分级 |
-| **RCA Agent** | 根因分析、影响链路构建 |
-| **Heal Agent** | 故障自愈操作执行 |
-| **Change Agent** | 变更风险评估和审批 |
-| **Memory Agent** | 记忆存储和检索 |
-| **Eval Agent** | 效果评估和持续优化 |
+## Local verification（本地验证）
 
-## 技术栈
+> 命名为 Local verification 而非 Quick Start：以下命令基于当前代码与已验证记录；完整的一键端到端启动体验未在通用环境做过验证。
 
-- **Web 框架**: FastAPI + Uvicorn
-- **Agent 框架**: LangGraph + LangChain
-- **LLM**: OpenAI GPT-4o / DeepSeek / 其他
-- **向量数据库**: ChromaDB
-- **可观测性**: Langfuse
-- **数据科学**: NumPy, scikit-learn, Pandas
-- **测试**: pytest, pytest-asyncio
-- **前端**: React 18 + TypeScript + Vite + Tailwind CSS
-- **部署**: Docker + Docker Compose
+**后端测试（干净克隆已验证）**：
+
+```bash
+cd backend
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pytest -q
+```
+
+注意：如果创建了 `backend/.env` 并自定义 CORS，测试要求 JSON 数组格式（逗号分隔字符串会导致 pydantic-settings 解析 list 字段失败）：
+
+```text
+APP_CORS_ORIGINS=["http://localhost:3000"]
+```
+
+**本地开发模式运行后端**：
+
+```bash
+cd backend
+cp .env.example .env   # 可选；不填 LLM Key 即为纯规则模式
+uvicorn app.main:app --reload
+```
+
+**Docker 构建（干净克隆已验证 backend 镜像构建）**：
+
+```bash
+docker compose build backend
+docker compose up -d   # backend :8000 / frontend :8080
+```
+
+说明：
+
+- `docker-compose.yml` 默认 `APP_ENV=production`；`/docs`、`/redoc` 与 `/openapi.json` 仅在 `APP_ENV=development` 时开放，生产环境关闭。
+- Compose 中的 `chroma` 容器只是编排预留：主代码当前使用 ChromaDB 本地 `PersistentClient`（见 [`backend/app/memory/storage.py`](backend/app/memory/storage.py)），并未连接该独立 Chroma 服务。
+- Compose 只透传 `LLM_API_KEY` / `LLM_PROVIDER` / `LLM_MODEL` 及 Langfuse 相关变量，不透传 `LLM_ENABLE_RCA/NLU/JUDGE` 功能开关——只填 Key 不会自动启用全部 LLM 功能。
+
+## Rule-only 与 Optional LLM 模式
+
+LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可完整跑通全流程：
+
+| 开关 | 默认 | 作用 | 降级行为 |
+|------|------|------|----------|
+| （不设 `LLM_API_KEY`） | 空 | 全局禁用 LLM 客户端 | 全部走规则路径 |
+| `LLM_ENABLE_RCA` | `false` | RCA 多路证据 LLM 融合推理 | 规则综合（贝叶斯+RAG+记忆）兜底 |
+| `LLM_ENABLE_NLU` | `false` | 自然语言理解慢路径 | 正则快路径兜底 |
+| `LLM_ENABLE_JUDGE` | `false` | 评测 LLM-as-Judge | 纯规则指标评分 |
+
+所有 LLM 输出经 `structured_completion` 做 Schema 校验与闭集候选校验（根因/服务名只能从系统给出的候选列表中选择），校验失败自动把错误反馈给模型重试；LLM 不可用抛 `LLMUnavailableError` 并降级规则路径，不影响 API 可用性。
+
+## 能力边界（如实声明）
+
+1. HTTP API 当前执行的是手写顺序管道；LangGraph 状态机是真实存在的独立演示路径，不承接 HTTP 请求。
+2. Heal Agent 只生成 Playbook 匹配结果、Dry-Run 模拟与风险评估，不对任何真实基础设施执行修复。
+3. 审批 `pending` 会暂停流程，但当前没有完整的"审批通过后恢复执行"API。
+4. Chroma 使用本地 `PersistentClient` 持久化，主代码未接入独立 Chroma 服务容器。
+5. 服务拓扑、指标数据、故障场景均来自内置模拟数据集（[`backend/app/data/`](backend/app/data/)）。
+6. 本项目不声称生产可用，不声称降低真实 MTTR，不声称实现线上自动自愈。
+
+## Demo / Synthetic Data 声明
+
+以下数据为演示或合成数据，非真实系统采集：
+
+- 故障场景、指标时序、服务拓扑、知识库与 Playbook：内置数据集（[`backend/app/data/datasets.py`](backend/app/data/datasets.py)、[`backend/app/data/knowledge_base.py`](backend/app/data/knowledge_base.py)、[`backend/app/data/playbooks.py`](backend/app/data/playbooks.py)）。
+- `/api/v1/agents` 与 `/api/v1/agents/{id}/status` 返回的执行次数、成功率为预设演示值。
+- `/api/v1/evaluations` 列表返回静态示例评估记录；`/api/v1/topology` 中节点 CPU/内存/延迟为模拟值。
+- 前端仪表盘的初始 incident 与统计数据为预置演示状态（[`frontend/src/store/useAppStore.ts`](frontend/src/store/useAppStore.ts)）。
+- 演示故障数据注入端点 `/api/v1/incidents/seed-demo` 仅在 development 环境开放。
+
+## Candidate Evaluation 说明
+
+[`eval_agent.py`](backend/app/agents/eval_agent.py) 实现了四维度（端到端 / 推理 / 工具调用 / RAG）评测框架，指标包括根因准确率、置信度校准、检索精确率等，并支持可选的 LLM-as-Judge 对推理链做融合评分（可配置独立 `judge_model` 防同源偏置）。
+
+定位说明：这是 **Candidate Evaluation（候选评测）**——在内置模拟场景与默认测试集上运行的候选指标，用于演示评测方法论，不是 Accepted Baseline，不构成对系统真实效果的验收结论。
+
+## 测试验证证据
+
+```text
+Clean-clone verification:
+345 passed / 1 skipped / 0 failed
+Backend Docker image build: passed
+Runtime data module import: passed
+```
+
+以上为冻结环境（固定依赖版本、本地干净克隆）下的一次性本地验证结果，用于证明仓库自洽可构建、测试套件全绿；不代表生产 SLA 或线上质量承诺。
 
 ## 项目结构
 
-```
+```text
 aiops-agent-platform/
-├── backend/                        # FastAPI 后端
+├── backend/
 │   ├── app/
-│   │   ├── main.py                 # FastAPI 入口
-│   │   ├── config.py               # 配置管理 (pydantic-settings)
-│   │   ├── dependencies.py         # 依赖注入
-│   │   ├── models/                 # 数据模型
-│   │   ├── agents/                 # Agent 实现
-│   │   │   ├── base.py             # Agent 抽象基类
-│   │   │   ├── orchestrator.py     # LangGraph 编排器
-│   │   │   ├── monitor_agent.py    # 监控告警 Agent
-│   │   │   ├── rca_agent.py        # 根因分析 Agent
-│   │   │   ├── heal_agent.py       # 故障自愈 Agent
-│   │   │   ├── change_agent.py     # 变更审批 Agent
-│   │   │   ├── memory_agent.py     # 记忆管理 Agent
-│   │   │   └── eval_agent.py       # 评估 Agent
-│   │   ├── tools/                  # 工具集
-│   │   ├── memory/                 # 记忆系统
-│   │   ├── evaluation/             # 评估框架
-│   │   ├── services/               # 业务服务
-│   │   ├── data/                   # 数据集和知识库
-│   │   ├── utils/                  # 工具函数
-│   │   └── api/                    # API 路由
-│   ├── requirements.txt
-│   ├── Dockerfile
-│   └── start.sh
-├── frontend/                       # React 前端
-│   ├── src/                        # 源代码
-│   ├── public/                     # 静态资源
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── tailwind.config.js
-│   ├── tsconfig.json
-│   ├── nginx.conf                  # Nginx 配置
-│   └── Dockerfile
-├── docker-compose.yml              # 生产环境编排
-├── docker-compose.dev.yml          # 开发环境编排
-├── .env.example                    # 环境变量模板
-├── deploy.sh                       # 一键部署脚本
-├── .gitignore
-└── README.md                       # 项目说明
+│   │   ├── agents/          # Monitor / RCA / Heal / Change / Eval / Orchestrator
+│   │   ├── api/             # REST 路由（含 HTTP 顺序管道）/ WebSocket / Webhook
+│   │   ├── data/            # 内置模拟数据集、知识库、Playbook
+│   │   ├── evaluation/      # 四维度评测框架与指标
+│   │   ├── memory/          # 三层记忆系统 + ChromaDB 本地存储
+│   │   ├── nlu/             # 意图识别 / 实体抽取 / 指标映射 / 快慢路径
+│   │   ├── services/        # LLM 服务 / Langfuse / Incident 服务
+│   │   ├── config.py        # pydantic-settings 分组配置
+│   │   └── main.py          # FastAPI 入口与生命周期
+│   ├── tests/               # 全量测试套件
+│   └── .env.example         # 本地开发环境变量模板
+├── frontend/                # React 18 + TypeScript + Vite 仪表盘
+├── docker-compose.yml       # 生产编排（APP_ENV=production）
+├── docker-compose.dev.yml   # 开发编排（含 Prometheus 等可观测性组件）
+└── .env.example             # Docker 部署环境变量模板
 ```
 
-## 快速开始
-
-### 环境要求
-
-- Python 3.11+ (本地开发)
-- Node.js 20+ (本地开发)
-- Docker 24.0+ & Docker Compose v2+ (推荐)
-- 至少 4GB 可用内存
-
----
-
-## Docker 部署（推荐）
-
-### 前置要求
-
-- 安装 [Docker](https://docs.docker.com/get-docker/)
-- 安装 [Docker Compose](https://docs.docker.com/compose/install/)
-- 获取 LLM API Key（OpenAI 或 DeepSeek）
-
-### 1. 克隆项目
-
-```bash
-git clone <repository-url>
-cd aiops-agent-platform
-```
-
-### 2. 配置环境变量
-
-```bash
-# 复制环境变量模板
-cp .env.example .env
-
-# 编辑 .env 文件，填入你的 API Key
-vi .env
-```
-
-### 3. 一键部署
-
-```bash
-# 赋予执行权限并运行部署脚本
-chmod +x deploy.sh
-./deploy.sh
-```
-
-部署脚本支持以下命令：
-
-| 命令 | 说明 |
-|------|------|
-| `./deploy.sh` | 生产环境部署（默认） |
-| `./deploy.sh dev` | 开发环境部署（支持热重载） |
-| `./deploy.sh stop` | 停止生产环境服务 |
-| `./deploy.sh stop-dev` | 停止开发环境服务 |
-| `./deploy.sh restart` | 重启服务 |
-| `./deploy.sh logs` | 查看实时日志 |
-| `./deploy.sh logs-dev` | 查看开发环境日志 |
-| `./deploy.sh status` | 查看服务状态和资源使用 |
-| `./deploy.sh health` | 健康检查 |
-| `./deploy.sh cleanup` | 清理所有容器和数据（谨慎使用） |
-| `./deploy.sh help` | 显示帮助信息 |
-
-### 4. 服务访问
-
-部署完成后，可通过以下地址访问服务：
-
-| 服务 | 地址 | 说明 |
-|------|------|------|
-| 前端界面 | http://localhost:8080 | React SPA（Nginx） |
-| 后端 API | http://localhost:8000 | FastAPI + Uvicorn |
-| API 文档 | http://localhost:8000/docs | Swagger UI |
-| ReDoc | http://localhost:8000/redoc | 替代 API 文档 |
-| ChromaDB | http://localhost:8001 | 向量数据库 |
-
-### 5. Docker Compose 手动部署
-
-如需手动控制部署过程：
-
-```bash
-# 生产环境
-docker-compose -f docker-compose.yml up -d --build
-
-# 开发环境（热重载）
-docker-compose -f docker-compose.dev.yml up -d --build
-
-# 查看日志
-docker-compose logs -f
-
-# 停止服务
-docker-compose down
-
-# 停止并清理数据卷（谨慎）
-docker-compose down -v
-```
-
-### 6. 验证部署
-
-```bash
-# 检查服务健康状态
-curl http://localhost:8000/health
-
-# 检查后端就绪状态
-curl http://localhost:8000/ready
-
-# 查看API文档（如果配置了OPEN API）
-# 浏览器访问 http://localhost:8000/docs
-```
-
----
-
-## 环境变量说明
-
-所有环境变量可通过 `.env` 文件配置，以下为主要配置项：
-
-### LLM 配置（必填）
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `LLM_API_KEY` | 主 LLM API 密钥 | - |
-| `LLM_PROVIDER` | LLM 提供商：`openai` / `deepseek` / `azure-openai` | `openai` |
-| `LLM_MODEL` | 模型名称 | `gpt-4o-mini` |
-
-### 特定提供商配置（可选）
-
-| 变量 | 说明 |
-|------|------|
-| `OPENAI_API_KEY` | OpenAI 专用 API Key |
-| `DEEPSEEK_API_KEY` | DeepSeek 专用 API Key |
-
-### Langfuse 配置（可选）
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `LANGFUSE_PUBLIC_KEY` | Langfuse Public Key | - |
-| `LANGFUSE_SECRET_KEY` | Langfuse Secret Key | - |
-| `LANGFUSE_HOST` | Langfuse 服务地址 | `https://cloud.langfuse.com` |
-| `LANGFUSE_ENABLED` | 是否启用 Langfuse | `false` |
-
-### 应用配置
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `APP_ENV` | 运行环境：`development` / `production` | `development` |
-| `APP_LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
-
-### 高级配置
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `AGENT_EXECUTION_TIMEOUT_SECONDS` | Agent 执行超时 | `120` |
-| `AGENT_MAX_ITERATIONS` | 最大迭代次数 | `10` |
-| `AGENT_HEAL_DRY_RUN` | 自愈操作仅模拟 | `true` |
-| `DATABASE_URL` | 数据库连接 URL | `sqlite:///./data/aiops.db` |
-| `CHROMA_DB_HOST` | ChromaDB 主机 | `chroma` |
-| `WS_MAX_CONNECTIONS` | WebSocket 最大连接数 | `100` |
-
----
-
-## 本地开发
-
-### 后端开发
-
-```bash
-cd backend
-
-# 创建虚拟环境
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate   # Windows
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env
-# 编辑 .env 填入 API Key
-
-# 启动服务（热重载）
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 前端开发
-
-```bash
-cd frontend
-
-# 安装依赖
-npm install
-
-# 启动开发服务器
-npm run dev
-
-# 前端服务默认运行在 http://localhost:3000
-```
-
-### 开发环境特性
-
-- **后端热重载**：修改代码后自动重启服务
-- **前端热更新**：修改代码后浏览器自动刷新
-- **API 代理**：开发服务器自动代理 `/api` 和 `/ws` 到后端
-- **完整 API 文档**：访问 http://localhost:8000/docs
-
----
-
-## API 端点
-
-### 故障管理
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| POST | `/api/v1/incidents/trigger` | 触发故障处理 |
-| GET | `/api/v1/incidents/{id}` | 查询故障状态 |
-| GET | `/api/v1/incidents` | 故障列表 |
-
-### Agent 管理
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/v1/agents` | Agent 列表 |
-| GET | `/api/v1/agents/{id}/status` | Agent 状态 |
-
-### 评估
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/v1/evaluations` | 评估结果 |
-| POST | `/api/v1/evaluations/run` | 执行评估 |
-
-### 记忆
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/v1/memory/search` | 记忆搜索 |
-| POST | `/api/v1/memory/store` | 存储记忆 |
-
-### WebSocket
-
-| 端点 | 说明 |
-|------|------|
-| `/ws` | 通用 WebSocket（支持订阅） |
-| `/ws/incidents/{id}` | 故障实时更新 |
-
-### 健康检查
-
-| 端点 | 说明 |
-|------|------|
-| `/health` | 健康状态 |
-| `/ready` | 就绪状态 |
-
----
-
-## 开发指南
-
-### 添加新 Agent
-
-1. 在 `app/agents/` 下创建新的 Agent 文件
-2. 继承 `BaseAgent` 抽象基类
-3. 实现 `process()`, `get_name()`, `get_description()` 方法
-4. 在 `app/agents/__init__.py` 中导出
-
-```python
-from app.agents.base import AgentResult, BaseAgent
-from app.models.agent import AgentExecutionContext
-
-class MyAgent(BaseAgent[MyInput, MyOutput]):
-    def get_name(self) -> str:
-        return "my_agent"
-
-    def get_description(self) -> str:
-        return "My agent description"
-
-    async def process(self, input_data, context) -> AgentResult:
-        # 实现处理逻辑
-        return AgentResult.success_result(
-            agent_name=self.get_name(),
-            output_data={"result": "success"},
-        )
-```
-
-### 添加新工具
-
-1. 在 `app/tools/` 下创建新的工具文件
-2. 继承 `BaseTool` 抽象基类
-3. 实现 `name`, `description`, `execute` 属性/方法
-4. 在 `app/tools/__init__.py` 中导出
-
----
-
-## 测试
-
-```bash
-cd backend
-
-# 运行所有测试
-pytest
-
-# 运行特定模块测试
-pytest tests/test_agents/
-
-# 带覆盖率报告
-pytest --cov=app --cov-report=html
-
-# 在Docker中运行测试
-docker-compose -f docker-compose.dev.yml run --rm backend-dev pytest
-```
-
----
-
-## Docker 架构说明
-
-### 服务架构
-
-```
-┌─────────────────────────────────────────────┐
-│              Docker Network                  │
-│         (aiops-network / bridge)            │
-│                                             │
-│  ┌──────────────┐    ┌──────────────┐      │
-│  │   Frontend   │    │   Backend    │      │
-│  │  (Nginx:80)  │◄──►│(Uvicorn:8000)│      │
-│  │   :8080      │    │   :8000      │      │
-│  └──────────────┘    └──────┬───────┘      │
-│                             │               │
-│                             ▼               │
-│                      ┌──────────────┐      │
-│                      │   ChromaDB   │      │
-│                      │   :8000      │      │
-│                      └──────────────┘      │
-│                         :8001               │
-└─────────────────────────────────────────────┘
-```
-
-### 镜像说明
-
-| 镜像 | 基础 | 说明 |
-|------|------|------|
-| aiops-backend | `python:3.11-slim` | 多阶段构建，非root运行 |
-| aiops-frontend | `node:20-alpine` + `nginx:alpine` | 多阶段构建，SPA路由支持 |
-| aiops-chroma | `chromadb/chroma:latest` | 向量数据库 |
-
-### 数据持久化
-
-| 卷名 | 用途 | 挂载路径 |
-|------|------|----------|
-| `aiops-data` | SQLite数据库、日志 | `/app/data` |
-| `chroma-data` | 向量数据 | `/chroma/chroma` |
-
----
-
-## 常见问题
-
-### Q: 部署后无法访问服务？
-
-检查容器状态：
-```bash
-docker-compose ps
-docker-compose logs
-```
-
-确保端口未被占用：
-```bash
-lsof -i :8000  # 检查8000端口
-lsof -i :8080  # 检查8080端口
-```
-
-### Q: API Key 如何配置？
-
-编辑项目根目录的 `.env` 文件：
-```bash
-LLM_API_KEY=sk-your-actual-api-key
-```
-
-修改后重启服务：
-```bash
-./deploy.sh restart
-```
-
-### Q: 如何查看详细日志？
-
-```bash
-# 查看所有服务日志
-./deploy.sh logs
-
-# 查看特定服务日志
-./deploy.sh logs backend
-./deploy.sh logs frontend
-
-# 查看最后100行日志
-docker-compose logs --tail=100
-```
-
-### Q: 如何更新到最新版本？
-
-```bash
-# 拉取最新代码
-git pull origin main
-
-# 重新构建并部署
-./deploy.sh
-```
-
----
-
-## 路线图
-
-- [x] 项目脚手架搭建
-- [x] Agent 框架设计
-- [x] LangGraph 编排器
-- [x] 记忆系统框架
-- [x] 评估框架
-- [x] RESTful API
-- [x] WebSocket 实时通信
-- [x] Docker 化部署
-- [ ] LLM 集成实现
-- [ ] 知识库向量化
-- [ ] 前端界面开发
-- [ ] Kubernetes 部署支持
-- [ ] CI/CD 流水线
+## 技术栈
+
+- **后端**：Python 3.11 · FastAPI · Uvicorn · Pydantic v2 · structlog
+- **Agent 编排**：手写顺序管道（HTTP 主路径）· LangGraph（独立状态机演示）
+- **算法**：NumPy · scikit-learn（Isolation Forest）· 贝叶斯推理 · BFS 拓扑遍历
+- **LLM（可选）**：OpenAI 兼容 SDK（OpenAI / DeepSeek），结构化输出 + 规则降级
+- **存储**：ChromaDB（本地 PersistentClient）· SQLite
+- **可观测性**：Prometheus 指标 · Langfuse 埋点（可选）
+- **前端**：React 18 · TypeScript · Vite · Tailwind CSS · Zustand
+- **测试 / 部署**：pytest · pytest-asyncio · Docker · Docker Compose
 
 ## License
 
-MIT License
+[MIT](LICENSE) © 2026 Steven2001-LI
