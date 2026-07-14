@@ -21,6 +21,8 @@
 1. **HTTP Demo Pipeline（当前 API 的实际执行器）**：`POST /api/v1/incidents/trigger` 触发的是 [`routes.py`](backend/app/api/routes.py) 中手写的顺序管道 `_process_incident_pipeline`——Monitor → RCA → Heal(Dry-Run) → Change 依次执行，任一阶段失败转人工升级（ESCALATED），审批 `pending` 则暂停流程（当前没有完整的审批恢复执行 API）。
 2. **独立 LangGraph 状态机（演示路径）**：[`orchestrator.py`](backend/app/agents/orchestrator.py) 用 LangGraph 构建了同语义的条件路由状态机（含人工升级、pending 暂停终态、模拟解决），应用启动时会真实构建，可通过 `Orchestrator.process_alert()` 执行，有独立测试覆盖——但它**不是**当前 HTTP 请求的执行器。
 
+Candidate Evaluation 不会在 Incident Pipeline 结束后自动运行；需要通过独立的 `POST /api/v1/evaluations/run` 端点手动触发。
+
 ## 架构图
 
 ```mermaid
@@ -33,7 +35,6 @@ flowchart TB
         C -->|approved / auto_approved| S[模拟解决 + 记忆归档]
         C -->|pending| P[暂停等待审批]
         M & R & H & C -->|任一阶段失败| E[人工升级 ESCALATED]
-        S --> EV[Eval Agent<br/>Candidate Evaluation]
     end
 
     subgraph LG["Independent LangGraph State Machine（独立演示路径，非 HTTP 执行器）"]
@@ -41,6 +42,10 @@ flowchart TB
         CR -->|失败| HE[Human Escalation]
         CR -->|审批通过| SR[Simulated Resolution]
         CR -->|pending| PE[合法暂停终态]
+    end
+
+    subgraph EVAL["Independent Candidate Evaluation（独立手动触发）"]
+        EP[POST /api/v1/evaluations/run] -.->|Independent evaluation endpoint| EV[Eval Agent<br/>Candidate Evaluation]
     end
 ```
 
@@ -94,7 +99,7 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-注意：如果创建了 `backend/.env` 并自定义 CORS，测试要求 JSON 数组格式（逗号分隔字符串会导致 pydantic-settings 解析 list 字段失败）：
+注意：Compose 默认值已使用 JSON 字符串数组；如果创建 `backend/.env` 并自定义 CORS，也必须使用相同格式（逗号分隔字符串会导致 pydantic-settings 解析 list 字段失败）：
 
 ```text
 APP_CORS_ORIGINS=["http://localhost:3000"]
@@ -119,7 +124,7 @@ docker compose up -d   # backend :8000 / frontend :8080
 
 - `docker-compose.yml` 默认 `APP_ENV=production`；`/docs`、`/redoc` 与 `/openapi.json` 仅在 `APP_ENV=development` 时开放，生产环境关闭。
 - Compose 中的 `chroma` 容器只是编排预留：主代码当前使用 ChromaDB 本地 `PersistentClient`（见 [`backend/app/memory/storage.py`](backend/app/memory/storage.py)），并未连接该独立 Chroma 服务。
-- Compose 只透传 `LLM_API_KEY` / `LLM_PROVIDER` / `LLM_MODEL` 及 Langfuse 相关变量，不透传 `LLM_ENABLE_RCA/NLU/JUDGE` 功能开关——只填 Key 不会自动启用全部 LLM 功能。
+- 当前主 LLM 配置读取 `LLM_API_KEY` / `LLM_PROVIDER` / `LLM_MODEL`；Compose 保留的 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` 兼容透传项不会被当前主 `LLMService` 自动读取。Compose 不透传 `LLM_ENABLE_RCA/NLU/JUDGE` 功能开关——只填 Key 不会自动启用全部 LLM 功能。
 
 ## Rule-only 与 Optional LLM 模式
 
@@ -155,7 +160,7 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 
 ## Candidate Evaluation 说明
 
-[`eval_agent.py`](backend/app/agents/eval_agent.py) 实现了四维度（端到端 / 推理 / 工具调用 / RAG）评测框架，指标包括根因准确率、置信度校准、检索精确率等，并支持可选的 LLM-as-Judge 对推理链做融合评分（可配置独立 `judge_model` 防同源偏置）。
+[`eval_agent.py`](backend/app/agents/eval_agent.py) 实现了四维度（端到端 / 推理 / 工具调用 / RAG）评测框架，指标包括根因准确率、置信度校准、检索精确率等，并支持可选的 LLM-as-Judge 对推理链做融合评分（可配置独立 `judge_model` 防同源偏置）。评测通过独立的 `POST /api/v1/evaluations/run` 端点手动触发，不是 Incident Pipeline 的自动下游步骤。
 
 定位说明：这是 **Candidate Evaluation（候选评测）**——在内置模拟场景与默认测试集上运行的候选指标，用于演示评测方法论，不是 Accepted Baseline，不构成对系统真实效果的验收结论。
 
@@ -168,7 +173,7 @@ Backend Docker image build: passed
 Runtime data module import: passed
 ```
 
-以上为冻结环境（固定依赖版本、本地干净克隆）下的一次性本地验证结果，用于证明仓库自洽可构建、测试套件全绿；不代表生产 SLA 或线上质量承诺。
+以上为在该次验证日期由当前依赖约束解析出的环境中完成的一次干净克隆验证，用于证明仓库自洽可构建、测试套件全绿；不代表生产 SLA 或线上质量承诺。
 
 ## 项目结构
 

@@ -33,7 +33,7 @@ services:
       - APP_PORT=8000
       - APP_LOG_LEVEL=DEBUG
       - APP_DEBUG=true
-      - APP_CORS_ORIGINS=http://localhost:8080,http://localhost:3000,http://localhost:5173
+      - APP_CORS_ORIGINS=["http://localhost:8080","http://localhost:3000","http://localhost:5173"]
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
