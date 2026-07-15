@@ -1,5 +1,6 @@
-import { useState, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { StatusBadge } from '@/components/common/StatusBadge';
+import { useTopology } from '@/hooks/useApi';
 import {
   Server,
   Database,
@@ -34,33 +35,26 @@ interface ServiceEdge {
   status: 'healthy' | 'warning' | 'critical';
 }
 
-const mockNodes: ServiceNode[] = [
-  { id: 'gateway', name: 'API Gateway', type: 'gateway', status: 'healthy', x: 400, y: 60, metrics: { cpu: 35, memory: 60, latency: 12, error_rate: 0.1 } },
-  { id: 'user-svc', name: 'user-service', type: 'service', status: 'healthy', x: 200, y: 180, metrics: { cpu: 42, memory: 55, latency: 25, error_rate: 0.2 } },
-  { id: 'order-svc', name: 'order-service', type: 'service', status: 'warning', x: 400, y: 180, metrics: { cpu: 78, memory: 82, latency: 120, error_rate: 1.5 } },
-  { id: 'payment-svc', name: 'payment-service', type: 'service', status: 'healthy', x: 600, y: 180, metrics: { cpu: 30, memory: 45, latency: 18, error_rate: 0.1 } },
-  { id: 'inventory-svc', name: 'inventory-service', type: 'service', status: 'healthy', x: 100, y: 300, metrics: { cpu: 25, memory: 40, latency: 15, error_rate: 0.0 } },
-  { id: 'notification-svc', name: 'notification-service', type: 'service', status: 'healthy', x: 300, y: 300, metrics: { cpu: 20, memory: 35, latency: 8, error_rate: 0.0 } },
-  { id: 'db-primary', name: 'PostgreSQL Primary', type: 'database', status: 'healthy', x: 400, y: 420, metrics: { cpu: 55, memory: 70, latency: 5, error_rate: 0.0 } },
-  { id: 'db-replica', name: 'PostgreSQL Replica', type: 'database', status: 'healthy', x: 600, y: 420, metrics: { cpu: 40, memory: 60, latency: 8, error_rate: 0.0 } },
-  { id: 'redis', name: 'Redis Cluster', type: 'cache', status: 'healthy', x: 100, y: 420, metrics: { cpu: 15, memory: 80, latency: 2, error_rate: 0.0 } },
-  { id: 'kafka', name: 'Kafka', type: 'mq', status: 'warning', x: 500, y: 300, metrics: { cpu: 65, memory: 75, latency: 45, error_rate: 0.3 } },
-];
+const layoutPositions = [
+  [400, 60], [180, 165], [400, 165], [620, 165],
+  [110, 300], [300, 300], [500, 300], [690, 300],
+  [180, 430], [400, 430], [620, 430],
+] as const;
 
-const mockEdges: ServiceEdge[] = [
-  { source: 'gateway', target: 'user-svc', type: 'http', status: 'healthy' },
-  { source: 'gateway', target: 'order-svc', type: 'http', status: 'warning' },
-  { source: 'gateway', target: 'payment-svc', type: 'http', status: 'healthy' },
-  { source: 'order-svc', target: 'user-svc', type: 'rpc', status: 'healthy' },
-  { source: 'order-svc', target: 'payment-svc', type: 'rpc', status: 'healthy' },
-  { source: 'order-svc', target: 'inventory-svc', type: 'rpc', status: 'healthy' },
-  { source: 'order-svc', target: 'db-primary', type: 'db', status: 'warning' },
-  { source: 'payment-svc', target: 'db-replica', type: 'db', status: 'healthy' },
-  { source: 'user-svc', target: 'redis', type: 'cache', status: 'healthy' },
-  { source: 'order-svc', target: 'kafka', type: 'mq', status: 'warning' },
-  { source: 'notification-svc', target: 'kafka', type: 'mq', status: 'healthy' },
-  { source: 'inventory-svc', target: 'db-primary', type: 'db', status: 'healthy' },
-];
+function parseMetric(value: unknown): number {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return 0;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function inferNodeType(id: string): ServiceNode['type'] {
+  if (id.includes('gateway')) return 'gateway';
+  if (id.includes('mysql') || id.includes('postgres') || id.includes('elastic')) return 'database';
+  if (id.includes('redis') || id.includes('cache')) return 'cache';
+  if (id.includes('kafka') || id.includes('mq')) return 'mq';
+  return 'service';
+}
 
 const nodeIcons: Record<string, React.ReactNode> = {
   gateway: <Globe className="w-5 h-5" />,
@@ -85,17 +79,71 @@ const edgeColors: Record<string, string> = {
 
 export function TopologyPage() {
   const svgRef = useRef<SVGSVGElement>(null);
+  const { getTopology, loading, error } = useTopology();
+  const [nodes, setNodes] = useState<ServiceNode[]>([]);
+  const [edges, setEdges] = useState<ServiceEdge[]>([]);
   const [selectedNode, setSelectedNode] = useState<ServiceNode | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
-  const filteredNodes = mockNodes.filter(
+  const loadTopology = useCallback(async () => {
+    try {
+      const result = await getTopology();
+      const mappedNodes: ServiceNode[] = result.nodes.map((raw, index) => {
+        const id = String(raw.id || raw.service || `service-${index}`);
+        const metrics = (raw.metrics || {}) as Record<string, unknown>;
+        const [x, y] = layoutPositions[index % layoutPositions.length];
+        return {
+          id,
+          name: String(raw.name || id),
+          type: inferNodeType(id),
+          status: (raw.status as ServiceNode['status']) || 'unknown',
+          x,
+          y,
+          metrics: {
+            cpu: parseMetric(metrics.cpu),
+            memory: parseMetric(metrics.memory),
+            latency: parseMetric(metrics.latency),
+            error_rate: parseMetric(metrics.error_rate),
+          },
+        };
+      });
+      const statusById = new Map(mappedNodes.map((node) => [node.id, node.status]));
+      const mappedEdges: ServiceEdge[] = result.edges.map((raw) => {
+        const source = String(raw.source || '');
+        const target = String(raw.target || '');
+        const endpointStatuses = [statusById.get(source), statusById.get(target)];
+        const status: ServiceEdge['status'] = endpointStatuses.includes('critical')
+          ? 'critical'
+          : endpointStatuses.includes('warning')
+          ? 'warning'
+          : 'healthy';
+        return {
+          source,
+          target,
+          type: (raw.type as ServiceEdge['type']) || 'http',
+          status,
+        };
+      });
+      setNodes(mappedNodes);
+      setEdges(mappedEdges);
+    } catch {
+      setNodes([]);
+      setEdges([]);
+    }
+  }, [getTopology]);
+
+  useEffect(() => {
+    void loadTopology();
+  }, [loadTopology]);
+
+  const filteredNodes = nodes.filter(
     (n) =>
       searchQuery === '' ||
       n.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   const getConnectedEdges = (nodeId: string) =>
-    mockEdges.filter((e) => e.source === nodeId || e.target === nodeId);
+    edges.filter((e) => e.source === nodeId || e.target === nodeId);
 
   return (
     <div className="space-y-6">
@@ -108,8 +156,8 @@ export function TopologyPage() {
           </p>
         </div>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Wifi className="w-4 h-4 text-emerald-400" />
-          <span>实时监控中</span>
+          <Wifi className={`w-4 h-4 ${error ? 'text-red-400' : 'text-emerald-400'}`} />
+          <span>{loading ? '加载中' : error ? '数据不可用' : '已连接后端数据'}</span>
         </div>
       </div>
 
@@ -150,9 +198,9 @@ export function TopologyPage() {
             style={{ minHeight: 520 }}
           >
             {/* Edges */}
-            {mockEdges.map((edge, idx) => {
-              const source = mockNodes.find((n) => n.id === edge.source);
-              const target = mockNodes.find((n) => n.id === edge.target);
+            {edges.map((edge, idx) => {
+              const source = nodes.find((n) => n.id === edge.source);
+              const target = nodes.find((n) => n.id === edge.target);
               if (!source || !target) return null;
 
               const isHighlighted =
@@ -345,7 +393,7 @@ export function TopologyPage() {
                 {getConnectedEdges(selectedNode.id).map((edge, idx) => {
                   const otherId =
                     edge.source === selectedNode.id ? edge.target : edge.source;
-                  const other = mockNodes.find((n) => n.id === otherId);
+                  const other = nodes.find((n) => n.id === otherId);
                   if (!other) return null;
                   return (
                     <div
@@ -381,7 +429,7 @@ export function TopologyPage() {
             服务列表
           </h3>
           <div className="space-y-2 max-h-[400px] overflow-y-auto scrollbar-thin pr-1">
-            {mockNodes.map((node) => (
+            {nodes.map((node) => (
               <div
                 key={node.id}
                 className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-colors ${

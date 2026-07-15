@@ -60,37 +60,16 @@ const dimensionMeta: Record<
   },
 };
 
-const historyData = [
-  { date: '01-08', end_to_end: 82, reasoning: 88, tool_calling: 75, rag: 80 },
-  { date: '01-09', end_to_end: 84, reasoning: 89, tool_calling: 76, rag: 81 },
-  { date: '01-10', end_to_end: 83, reasoning: 90, tool_calling: 74, rag: 83 },
-  { date: '01-11', end_to_end: 85, reasoning: 89, tool_calling: 77, rag: 82 },
-  { date: '01-12', end_to_end: 86, reasoning: 91, tool_calling: 78, rag: 85 },
-  { date: '01-13', end_to_end: 85, reasoning: 90, tool_calling: 79, rag: 84 },
-  { date: '01-14', end_to_end: 86, reasoning: 91, tool_calling: 79, rag: 85 },
-  { date: '01-15', end_to_end: 88, reasoning: 91, tool_calling: 79, rag: 85 },
-];
-
-const radarData = [
-  { metric: '任务成功率', end_to_end: 92, reasoning: 0, tool_calling: 0, rag: 0 },
-  { metric: 'MTTR', end_to_end: 85, reasoning: 0, tool_calling: 0, rag: 0 },
-  { metric: '自动化率', end_to_end: 82, reasoning: 0, tool_calling: 0, rag: 0 },
-  { metric: '根因准确率', end_to_end: 0, reasoning: 94, tool_calling: 0, rag: 0 },
-  { metric: '置信度校准', end_to_end: 0, reasoning: 88, tool_calling: 0, rag: 0 },
-  { metric: '工具选择', end_to_end: 0, reasoning: 0, tool_calling: 82, rag: 0 },
-  { metric: '参数正确率', end_to_end: 0, reasoning: 0, tool_calling: 76, rag: 0 },
-  { metric: '检索精确率', end_to_end: 0, reasoning: 0, tool_calling: 0, rag: 88 },
-  { metric: '回答质量', end_to_end: 0, reasoning: 0, tool_calling: 0, rag: 82 },
-];
-
 export function EvaluationPage() {
   const { evaluations: storeEvals, setEvaluations } = useAppStore();
   const { listEvaluations, runEvaluation } = useEvaluations();
   const [selectedDimension, setSelectedDimension] = useState<string | null>(null);
   const [runningEval, setRunningEval] = useState(false);
+  const [evaluationError, setEvaluationError] = useState('');
 
   // Load evaluations from API
   const loadEvaluations = useCallback(async () => {
+    setEvaluationError('');
     try {
       const result = await listEvaluations();
       if (result?.items) {
@@ -103,8 +82,11 @@ export function EvaluationPage() {
         }));
         setEvaluations(mapped);
       }
-    } catch (_e) {
-      console.debug('[EvaluationPage] Using store fallback');
+    } catch (requestError) {
+      setEvaluations([]);
+      setEvaluationError(
+        requestError instanceof Error ? requestError.message : '评测历史加载失败'
+      );
     }
   }, [listEvaluations, setEvaluations]);
 
@@ -114,23 +96,55 @@ export function EvaluationPage() {
 
   const evaluations = storeEvals.length > 0 ? storeEvals : [];
 
-  const overallScore = evaluations.length > 0
-    ? evaluations.reduce((sum, e) => sum + e.overall_score, 0) / evaluations.length
-    : 85.7;
+  // 列表按最新在前返回；摘要和雷达图每个维度只采用最近一次真实运行。
+  const latestByDimension = new Map<string, (typeof evaluations)[number]>();
+  evaluations.forEach((item) => {
+    if (!latestByDimension.has(item.dimension)) latestByDimension.set(item.dimension, item);
+  });
+  const latestEvaluations = Array.from(latestByDimension.values());
+
+  const overallScore = latestEvaluations.length > 0
+    ? latestEvaluations.reduce((sum, item) => sum + item.overall_score, 0) / latestEvaluations.length
+    : 0;
+
+  const radarData = latestEvaluations.flatMap((item) =>
+    item.metrics.map((metric) => ({
+      metric: metric.name,
+      end_to_end: 0,
+      reasoning: 0,
+      tool_calling: 0,
+      rag: 0,
+      [item.dimension]: metric.score,
+    }))
+  );
+
+  const historyByTimestamp = new Map<string, Record<string, string | number>>();
+  [...evaluations].reverse().forEach((item) => {
+    const point = historyByTimestamp.get(item.timestamp) || {
+      date: new Date(item.timestamp).toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    };
+    point[item.dimension] = item.overall_score;
+    historyByTimestamp.set(item.timestamp, point);
+  });
+  const historyData = Array.from(historyByTimestamp.values());
 
   const handleRunEval = async () => {
     setRunningEval(true);
+    setEvaluationError('');
     try {
-      // Call the real API
       await runEvaluation('end_to_end');
-      // Reload evaluations after a brief delay
-      setTimeout(async () => {
-        await loadEvaluations();
-        setRunningEval(false);
-      }, 2000);
-    } catch (_e) {
-      // Fallback: simulate with timeout
-      setTimeout(() => setRunningEval(false), 3000);
+      await loadEvaluations();
+    } catch (requestError) {
+      setEvaluationError(
+        requestError instanceof Error ? requestError.message : '评测运行失败'
+      );
+    } finally {
+      setRunningEval(false);
     }
   };
 
@@ -167,6 +181,12 @@ export function EvaluationPage() {
         </button>
       </div>
 
+      {evaluationError && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400">
+          {evaluationError}
+        </div>
+      )}
+
       {/* Overall Score */}
       <div className="glass-card p-6">
         <div className="flex flex-col md:flex-row items-center gap-8">
@@ -179,7 +199,7 @@ export function EvaluationPage() {
               基于端到端、推理、工具调用和RAG四个维度的加权综合评分
             </p>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-              {evaluations.map((evalItem) => {
+              {latestEvaluations.map((evalItem) => {
                 const meta = dimensionMeta[evalItem.dimension];
                 return (
                   <div
@@ -215,6 +235,11 @@ export function EvaluationPage() {
                   </div>
                 );
               })}
+              {latestEvaluations.length === 0 && (
+                <p className="col-span-full text-sm text-muted-foreground">
+                  暂无真实评测记录，请先运行一次评测。
+                </p>
+              )}
             </div>
           </div>
         </div>
@@ -287,6 +312,7 @@ export function EvaluationPage() {
       )}
 
       {/* Charts */}
+      {evaluations.length > 0 && (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Radar Chart */}
         <div className="glass-card p-5">
@@ -369,7 +395,7 @@ export function EvaluationPage() {
                 fontSize={12}
               />
               <YAxis
-                domain={[60, 100]}
+                domain={[0, 100]}
                 stroke="hsl(var(--muted-foreground))"
                 fontSize={12}
               />
@@ -417,6 +443,7 @@ export function EvaluationPage() {
           </ResponsiveContainer>
         </div>
       </div>
+      )}
 
       {/* Evaluations List */}
       <div className="glass-card p-5">
@@ -473,6 +500,11 @@ export function EvaluationPage() {
               </div>
             );
           })}
+          {evaluations.length === 0 && (
+            <p className="py-8 text-center text-sm text-muted-foreground">
+              暂无评测报告。
+            </p>
+          )}
         </div>
       </div>
     </div>

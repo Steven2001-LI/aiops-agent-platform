@@ -9,8 +9,8 @@ interface ApiState<T> {
 }
 
 interface UseApiReturn<T> extends ApiState<T> {
-  get: (url: string) => Promise<T | null>;
-  post: (url: string, body: Record<string, unknown>) => Promise<T | null>;
+  get: (url: string) => Promise<T>;
+  post: (url: string, body: Record<string, unknown>) => Promise<T>;
 }
 
 /**
@@ -28,7 +28,7 @@ export function useApi<T = unknown>(): UseApiReturn<T> {
   const reqIdRef = useRef(0);
 
   // Stable fetch core — never changes, so downstream deps are safe
-  const fetchRef = useRef(async (url: string, options: RequestInit = {}): Promise<T | null> => {
+  const fetchRef = useRef(async (url: string, options: RequestInit = {}): Promise<T> => {
     const reqId = ++reqIdRef.current;
     setLoading(true);
     setError(null);
@@ -57,7 +57,7 @@ export function useApi<T = unknown>(): UseApiReturn<T> {
         setError(errorObj);
       }
       console.warn('[API]', errorObj.message);
-      return null;
+      throw errorObj;
     } finally {
       if (reqId === reqIdRef.current) {
         setLoading(false);
@@ -95,12 +95,12 @@ export function useIncidents() {
   const { get, post, data, loading, error } = api;
 
   const listIncidents = useCallback(
-    (params?: { severity?: string; status?: string; page?: number; limit?: number }) => {
+    (params?: { severity?: string; state?: string; page?: number; pageSize?: number }) => {
       const queryParams = new URLSearchParams();
       if (params?.severity) queryParams.append('severity', params.severity);
-      if (params?.status) queryParams.append('status', params.status);
+      if (params?.state) queryParams.append('state', params.state);
       if (params?.page) queryParams.append('page', String(params.page));
-      if (params?.limit) queryParams.append('limit', String(params.limit));
+      if (params?.pageSize) queryParams.append('page_size', String(params.pageSize));
       return get(`/incidents?${queryParams.toString()}`);
     },
     [get] // ✅ get is stable
@@ -201,8 +201,19 @@ export function useMemory() {
   );
 
   const storeMemory = useCallback(
-    (content: string, memoryType: string = 'observation', tags: string[] = []) =>
-      post('/memory/store', { content, memory_type: memoryType, tags }),
+    (
+      content: string,
+      memoryType: string = 'observation',
+      tags: string[] = [],
+      importance = 0.5,
+      key = ''
+    ) => post('/memory/store', {
+      content,
+      memory_type: memoryType,
+      tags,
+      importance,
+      key,
+    }),
     [post]
   );
 

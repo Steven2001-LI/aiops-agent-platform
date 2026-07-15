@@ -1,10 +1,10 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useAppStore } from '@/store/useAppStore';
+import { useMemory } from '@/hooks/useApi';
 import {
   Brain,
   Search,
   Plus,
-  Trash2,
   Tag,
   Clock,
   Star,
@@ -40,12 +40,29 @@ const typeColors: Record<string, { bg: string; text: string }> = {
   knowledge: { bg: 'bg-amber-400/10', text: 'text-amber-400' },
 };
 
+function toUiMemoryType(type: string): MemoryEntry['type'] {
+  if (type === 'episodic' || type === 'observation') return 'incident';
+  if (type === 'procedural') return 'playbook';
+  if (type === 'semantic') return 'knowledge';
+  return 'config';
+}
+
+function toApiMemoryType(type: MemoryEntry['type']): string {
+  if (type === 'incident') return 'episodic';
+  if (type === 'playbook') return 'procedural';
+  if (type === 'knowledge') return 'semantic';
+  return 'observation';
+}
+
 export function MemoryPage() {
   const { memories, setMemories } = useAppStore();
+  const { searchMemory, storeMemory, loading, error } = useMemory();
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<MemoryType>('all');
   const [selectedMemory, setSelectedMemory] = useState<MemoryEntry | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [memoryError, setMemoryError] = useState('');
   const [newMemory, setNewMemory] = useState({
     key: '',
     value: '',
@@ -53,6 +70,35 @@ export function MemoryPage() {
     importance: 0.8,
     tags: '',
   });
+
+  const loadMemories = useCallback(async (query = '运维故障') => {
+    setMemoryError('');
+    try {
+      const result = await searchMemory(query);
+      const mapped: MemoryEntry[] = result.results.map((raw, index) => {
+        const entry = (raw.entry || raw) as Record<string, unknown>;
+        return {
+          id: String(entry.memory_id || entry.id || `memory-${index}`),
+          key: String(entry.key || entry.summary || '未命名记忆'),
+          value: String(entry.value || entry.content || ''),
+          type: toUiMemoryType(String(entry.type || entry.memory_type || 'observation')),
+          created_at: String(entry.created_at || new Date().toISOString()),
+          importance: Number(entry.importance ?? entry.importance_score ?? 0.5),
+          tags: Array.isArray(entry.tags) ? entry.tags.map(String) : [],
+        };
+      });
+      setMemories(mapped);
+    } catch (requestError) {
+      setMemories([]);
+      setMemoryError(
+        requestError instanceof Error ? requestError.message : '记忆检索失败'
+      );
+    }
+  }, [searchMemory, setMemories]);
+
+  useEffect(() => {
+    void loadMemories();
+  }, [loadMemories]);
 
   const filteredMemories = memories.filter((m) => {
     const matchesSearch =
@@ -66,30 +112,35 @@ export function MemoryPage() {
     return matchesSearch && matchesType;
   });
 
-  const handleAddMemory = () => {
-    const memory: MemoryEntry = {
-      id: `MEM-${Date.now()}`,
-      key: newMemory.key,
-      value: newMemory.value,
-      type: newMemory.type,
-      created_at: new Date().toISOString(),
-      importance: newMemory.importance,
-      tags: newMemory.tags.split(',').map((t) => t.trim()).filter(Boolean),
-    };
-    setMemories([memory, ...memories]);
-    setShowAddModal(false);
-    setNewMemory({
-      key: '',
-      value: '',
-      type: 'knowledge',
-      importance: 0.8,
-      tags: '',
-    });
-  };
-
-  const handleDeleteMemory = (id: string) => {
-    setMemories(memories.filter((m) => m.id !== id));
-    if (selectedMemory?.id === id) setSelectedMemory(null);
+  const handleAddMemory = async () => {
+    if (!newMemory.value.trim()) return;
+    setSaving(true);
+    setMemoryError('');
+    const tags = newMemory.tags.split(',').map((tag) => tag.trim()).filter(Boolean);
+    try {
+      await storeMemory(
+        newMemory.value,
+        toApiMemoryType(newMemory.type),
+        tags,
+        newMemory.importance,
+        newMemory.key
+      );
+      await loadMemories(newMemory.value);
+      setShowAddModal(false);
+      setNewMemory({
+        key: '',
+        value: '',
+        type: 'knowledge',
+        importance: 0.8,
+        tags: '',
+      });
+    } catch (requestError) {
+      setMemoryError(
+        requestError instanceof Error ? requestError.message : '记忆存储失败'
+      );
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -121,6 +172,9 @@ export function MemoryPage() {
               placeholder="搜索记忆的key、value或标签..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void loadMemories(searchQuery || '运维故障');
+              }}
               className="w-full pl-9 pr-4 py-2 bg-background border border-input rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
             />
           </div>
@@ -143,6 +197,12 @@ export function MemoryPage() {
           </div>
         </div>
       </div>
+
+      {(memoryError || error) && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400">
+          {memoryError || error?.message}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Memory List */}
@@ -216,15 +276,6 @@ export function MemoryPage() {
                       )}
                     </div>
                   </div>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteMemory(memory.id);
-                    }}
-                    className="p-1.5 rounded-md text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-red-400/10 transition-all"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
                   <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0 self-center" />
                 </div>
               );
@@ -257,12 +308,6 @@ export function MemoryPage() {
                 >
                   {typeLabels[selectedMemory.type]}
                 </span>
-                <button
-                  onClick={() => handleDeleteMemory(selectedMemory.id)}
-                  className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-400/10 transition-colors"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
               </div>
             </div>
 
@@ -454,10 +499,10 @@ export function MemoryPage() {
                 </button>
                 <button
                   onClick={handleAddMemory}
-                  disabled={!newMemory.key || !newMemory.value}
+                  disabled={saving || loading || !newMemory.key || !newMemory.value}
                   className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
-                  添加
+                  {saving ? '存储中...' : '添加'}
                 </button>
               </div>
             </div>

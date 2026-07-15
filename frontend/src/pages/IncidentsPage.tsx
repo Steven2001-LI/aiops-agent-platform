@@ -170,9 +170,9 @@ export function IncidentsPage() {
     try {
       const result = await listIncidents({
         severity: severityFilter === 'all' ? undefined : severityFilter,
-        status: statusFilter === 'all' ? undefined : statusFilter,
+        state: statusFilter === 'all' ? undefined : statusFilter,
         page: currentPage,
-        limit: itemsPerPage,
+        pageSize: itemsPerPage,
       });
       if (result?.items) {
         // 转换后端数据格式到前端格式
