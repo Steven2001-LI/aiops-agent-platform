@@ -440,3 +440,85 @@ class TestEvaluationFramework:
 
         framework.reset_history()
         assert len(framework.get_history()) == 0
+
+
+class TestSendToLangfuse:
+    """send_to_langfuse 真实上报测试(此前是无条件返回 True 的占位实现)。"""
+
+    def _make_result(self) -> EvaluationResult:
+        from app.models.evaluation import MetricScore
+
+        return EvaluationResult(
+            evaluation_type=EvaluationType.END_TO_END,
+            eval_name="e2e_smoke",
+            agent_type="rca",
+            status=EvaluationStatus.COMPLETED,
+            overall_score=0.87,
+            metric_scores=[
+                MetricScore(metric_name="task_success_rate", score=0.9, weight=0.5),
+                MetricScore(metric_name="mttr_score", score=0.8, weight=0.5),
+            ],
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_skips_and_returns_false(self) -> None:
+        """conftest 强制 LANGFUSE_ENABLED=false:禁用时不再假装成功。"""
+        framework = EvaluationFramework()
+        assert await framework.send_to_langfuse(self._make_result()) is False
+
+    @pytest.mark.asyncio
+    async def test_enabled_reports_trace_and_scores(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """enabled 时创建 eval trace 并逐指标 + overall 打分。"""
+        from types import SimpleNamespace
+
+        class StubLangfuse:
+            def __init__(self) -> None:
+                self.traces: list[str] = []
+                self.scores: list[tuple[str, str, float]] = []
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def create_trace(self, name, metadata=None, user_id="", session_id="", tags=None):
+                self.traces.append(name)
+                return SimpleNamespace(id="trace-eval-001")
+
+            def score_trace(self, trace_id, name, value, comment=""):
+                self.scores.append((trace_id, name, value))
+
+        stub = StubLangfuse()
+        monkeypatch.setattr(
+            "app.services.langfuse_service.get_langfuse_service", lambda: stub
+        )
+
+        framework = EvaluationFramework()
+        result = self._make_result()
+        assert await framework.send_to_langfuse(result) is True
+
+        assert stub.traces == ["eval_end_to_end"]
+        assert len(stub.scores) == 3  # 2 个指标 + overall_score
+        assert ("trace-eval-001", "task_success_rate", 0.9) in stub.scores
+        assert ("trace-eval-001", "overall_score", 0.87) in stub.scores
+
+    @pytest.mark.asyncio
+    async def test_stub_failure_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """上报中途异常返回 False,不向调用方抛出。"""
+
+        class BrokenLangfuse:
+            def is_enabled(self) -> bool:
+                return True
+
+            def create_trace(self, *args, **kwargs):
+                raise RuntimeError("network down")
+
+        monkeypatch.setattr(
+            "app.services.langfuse_service.get_langfuse_service",
+            lambda: BrokenLangfuse(),
+        )
+
+        framework = EvaluationFramework()
+        assert await framework.send_to_langfuse(self._make_result()) is False

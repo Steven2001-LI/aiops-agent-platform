@@ -126,6 +126,9 @@ class EvaluationFramework:
             # 记录到历史
             self._record_run(eval_type, result)
 
+            # 上报 Langfuse(disabled 时 O(1) 早退;上报失败不影响评估结果)
+            await self.send_to_langfuse(result)
+
             return result
 
         except Exception as e:
@@ -420,43 +423,70 @@ class EvaluationFramework:
         trace_id: str = "",
     ) -> bool:
         """
-        将评估结果上报到 Langfuse (可选集成)
+        将评估结果上报到 Langfuse
+
+        enabled 时经 LangfuseService 创建 eval trace 并逐指标打分;
+        disabled/未初始化时静默跳过并返回 False(不再假装成功)。
 
         Args:
             result: 评估结果
-            trace_id: Langfuse trace ID
+            trace_id: 复用已有 trace 时传入,否则新建 eval trace
 
         Returns:
-            bool: 是否成功
+            bool: 是否真实完成上报
         """
         try:
-            # 注意: 这是 Langfuse 集成的占位实现
-            # 实际集成需要安装 langfuse 包并配置 API key
-            #
-            # 示例代码:
-            # from langfuse import Langfuse
-            # langfuse = Langfuse()
-            # trace = langfuse.trace(
-            #     id=trace_id or result.result_id,
-            #     name=f"eval_{result.evaluation_type.value}",
-            #     metadata={
-            #         "overall_score": result.overall_score,
-            #         "eval_type": result.evaluation_type.value,
-            #     }
-            # )
-            # for metric in result.metric_scores:
-            #     trace.score(
-            #         name=metric.metric_name,
-            #         value=metric.score,
-            #         comment=metric.details.get("description", ""),
-            #     )
+            # 函数内 import,避免 evaluation 层与 services 层的循环依赖
+            # (与 llm_service._log_langfuse 同款模式;埋点绝不影响主流程)
+            from app.services.langfuse_service import get_langfuse_service
+
+            lf = get_langfuse_service()
+            if not lf.is_enabled():
+                logger.debug(
+                    "Langfuse disabled, skipping evaluation report",
+                    result_id=result.result_id,
+                )
+                return False
+
+            tid = trace_id
+            if not tid:
+                trace = lf.create_trace(
+                    name=f"eval_{result.evaluation_type.value}",
+                    metadata={
+                        "result_id": result.result_id,
+                        "eval_name": result.eval_name,
+                        "agent_type": result.agent_type,
+                        "overall_score": result.overall_score,
+                    },
+                    tags=["evaluation", result.evaluation_type.value],
+                )
+                tid = getattr(trace, "id", "")
+            if not tid:
+                logger.warning(
+                    "Langfuse trace id unavailable, evaluation report skipped",
+                    result_id=result.result_id,
+                )
+                return False
+
+            for metric in result.metric_scores:
+                lf.score_trace(
+                    trace_id=tid,
+                    name=metric.metric_name,
+                    value=metric.score,
+                    comment=str(metric.details.get("description", "")),
+                )
+            lf.score_trace(
+                trace_id=tid,
+                name="overall_score",
+                value=result.overall_score,
+                comment=f"eval_type={result.evaluation_type.value}",
+            )
 
             logger.info(
-                "Langfuse integration placeholder",
+                "Evaluation reported to Langfuse",
                 result_id=result.result_id,
-                eval_type=result.evaluation_type.value,
-                overall_score=result.overall_score,
-                trace_id=trace_id,
+                trace_id=tid,
+                metric_count=len(result.metric_scores),
             )
             return True
 
