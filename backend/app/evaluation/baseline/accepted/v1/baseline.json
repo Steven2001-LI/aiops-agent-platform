@@ -1,0 +1,295 @@
+{
+  "schema_version": 1,
+  "name": "accepted-baseline-v1",
+  "generated_at": "2026-07-15T14:03:43.265438+00:00",
+  "evaluated_git_sha": "98be186eab7b9992ccc60ec534c13ac260b62273",
+  "git_dirty": true,
+  "dataset": {
+    "source": "app.data.datasets.FAULT_SCENARIOS (golden/fault_scenarios.json)",
+    "total_scenarios": 15,
+    "evaluated_count": 11,
+    "excluded": {
+      "ids": [
+        "fs_biz_007",
+        "fs_biz_008",
+        "fs_biz_009",
+        "fs_biz_010"
+      ],
+      "reason": "业务信号场景无告警指标,不走告警驱动 RCA 路径"
+    },
+    "content_hash": "2fe1a467a4128eea27214072befc6465f842e0142fda0c14f8d66acc9b956b75"
+  },
+  "environment": {
+    "python": "3.11.15",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "llm": {
+      "enable_rca": false,
+      "enable_nlu": false,
+      "enable_judge": false
+    },
+    "memory": "isolated (no ChromaDB history)"
+  },
+  "metric_definitions": "app.agents.eval_agent.ReasoningMetrics",
+  "scope_note": "只收 reasoning 维度规则指标;end_to_end 维度需要完整管道驱动,不在本基线范围。根因为精确串匹配,闭集通用根因与场景具体真值的命名差异会如实压低准确率——这是参照点,不是成绩单。",
+  "per_case": [
+    {
+      "scenario_id": "fs_001",
+      "service": "order-service",
+      "metric": "cpu_usage_percent",
+      "predicted_root_cause": "traffic_spike",
+      "expected_root_cause": "recent_deployment",
+      "root_cause_correct": false,
+      "root_cause_in_top3": true,
+      "confidence": 0.3374,
+      "predicted_actions": [
+        "rollback_deployment",
+        "check_configuration",
+        "restart_pod",
+        "scale_up_resources",
+        "scale_up_instances",
+        "enable_rate_limiting",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "rollback_deployment"
+      ],
+      "action_hit": true
+    },
+    {
+      "scenario_id": "fs_002",
+      "service": "payment-service",
+      "metric": "memory_usage_percent",
+      "predicted_root_cause": "resource_exhaustion",
+      "expected_root_cause": "memory_leak",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.3961,
+      "predicted_actions": [
+        "restart_pod",
+        "scale_up_resources",
+        "check_resource_limits",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "restart_pod"
+      ],
+      "action_hit": true
+    },
+    {
+      "scenario_id": "fs_003",
+      "service": "user-service",
+      "metric": "p99_latency_ms",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "database_connection_pool_exhausted",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.2692,
+      "predicted_actions": [
+        "check_dependencies",
+        "failover",
+        "rollback_deployment",
+        "check_configuration",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "scale_up"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_004",
+      "service": "inventory-service",
+      "metric": "p99_latency_ms",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "cache_failure",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.2692,
+      "predicted_actions": [
+        "check_dependencies",
+        "failover",
+        "rollback_deployment",
+        "check_configuration",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "restart_pod"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_005",
+      "service": "api-gateway",
+      "metric": "error_rate_percent",
+      "predicted_root_cause": "upstream_service_down",
+      "expected_root_cause": "configuration_error",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.3557,
+      "predicted_actions": [
+        "check_dependencies",
+        "failover",
+        "investigate_manually",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "rollback_config"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_biz_001",
+      "service": "payment-service",
+      "metric": "payment_failure_rate",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "third_party_timeout",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.1351,
+      "predicted_actions": [
+        "check_dependencies",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "enable_payment_fallback"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_biz_002",
+      "service": "order-service",
+      "metric": "order_backlog_count",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "inventory_data_stale",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.1962,
+      "predicted_actions": [
+        "rollback_deployment",
+        "check_configuration",
+        "check_dependencies",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "reconcile_inventory"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_biz_003",
+      "service": "user-service",
+      "metric": "auth_failure_rate",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "token_cache_expired",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.1351,
+      "predicted_actions": [
+        "check_dependencies",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "enable_static_auth"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_biz_004",
+      "service": "api-gateway",
+      "metric": "rate_limit_hit_rate",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "rate_limit_misconfig",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.1351,
+      "predicted_actions": [
+        "check_dependencies",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "adjust_rate_limit"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_biz_005",
+      "service": "order-service",
+      "metric": "mq_consumer_lag",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "corrupted_message",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.1962,
+      "predicted_actions": [
+        "rollback_deployment",
+        "check_configuration",
+        "check_dependencies",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "skip_corrupted_message"
+      ],
+      "action_hit": false
+    },
+    {
+      "scenario_id": "fs_biz_006",
+      "service": "inventory-service",
+      "metric": "replication_lag_seconds",
+      "predicted_root_cause": "dependency_failure",
+      "expected_root_cause": "replication_lag",
+      "root_cause_correct": false,
+      "root_cause_in_top3": false,
+      "confidence": 0.1351,
+      "predicted_actions": [
+        "check_dependencies",
+        "enable_circuit_breaker",
+        "notify_oncall",
+        "prepare_rollback"
+      ],
+      "expected_actions": [
+        "force_reindex"
+      ],
+      "action_hit": false
+    }
+  ],
+  "aggregate": {
+    "reasoning": {
+      "root_cause_accuracy": 0.0,
+      "root_cause_top3_hit_rate": 0.0909,
+      "confidence_calibration_error": 0.2328,
+      "confidence_calibration_score": 0.3017,
+      "impact_chain_precision": 0.0,
+      "impact_chain_recall": 0.0,
+      "impact_chain_f1": 0.0,
+      "evidence_completeness": 1.0,
+      "reasoning_chain_quality": 0.0,
+      "suggested_action_accuracy": 0.1818,
+      "mean_confidence": 0.2328
+    },
+    "overall_score": 0.3891
+  },
+  "result_hash": "4d7a75a64075040d23547fe5ea03eff1a42836735c2fe6b722043b41dec61b8a",
+  "acceptance": {
+    "status": "accepted",
+    "accepted_by": "Steven Li (repo owner)",
+    "accepted_at": "2026-07-15T14:03:43.282470+00:00",
+    "criteria": "确定性双跑一致 + 场景真值为仓库作者手写并复核的合成场景 + 纯规则路径(LLM 全关/记忆隔离);仅作为仓库代码在合成场景上的确定性参照点,不构成对真实生产效果的结论"
+  }
+}
