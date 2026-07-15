@@ -757,16 +757,36 @@ class ChromaDBStorage(BaseStorage):
         return conditions if conditions else None
 
     def _parse_chroma_result(self, result: dict[str, Any], index: int = 0) -> MemoryEntry | None:
-        """解析ChromaDB查询结果为MemoryEntry"""
+        """解析ChromaDB查询结果为MemoryEntry
+
+        兼容两种返回结构:collection.query() 的字段是嵌套列表
+        (ids: [["id1", ...]]),collection.get() 的字段是扁平列表
+        (ids: ["id1", ...])。此前只按 query() 结构解析,导致按 ID/
+        按过滤条件读取(get 路径)永远解析失败。
+        """
         try:
-            memory_id = result["ids"][0][index]
-            document = result["documents"][0][index] if result["documents"] else ""
-            metadata = result["metadatas"][0][index] if result["metadatas"] else {}
-            embedding = (
-                result["embeddings"][0][index]
-                if result.get("embeddings") and result["embeddings"][0]
-                else None
-            )
+            ids = result["ids"]
+            nested = bool(len(ids)) and isinstance(ids[0], (list, tuple))
+
+            def _field(name: str) -> Any:
+                # embeddings 可能是 numpy 数组,只做 None/长度判断,不做真值判断
+                values = result.get(name)
+                if values is None:
+                    return None
+                if nested:
+                    if len(values) == 0:
+                        return None
+                    values = values[0]
+                if values is None or len(values) <= index:
+                    return None
+                return values[index]
+
+            memory_id = ids[0][index] if nested else ids[index]
+            document = _field("documents") or ""
+            metadata = _field("metadatas") or {}
+            embedding = _field("embeddings")
+            if embedding is not None and not isinstance(embedding, list):
+                embedding = list(embedding)
 
             return MemoryEntry(
                 memory_id=memory_id,
