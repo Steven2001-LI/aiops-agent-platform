@@ -1,0 +1,275 @@
+[
+  {
+    "id": "fs_001",
+    "name": "Deployment-induced CPU spike",
+    "description": "Recent deployment causes CPU usage to spike",
+    "service": "order-service",
+    "category": "infrastructure",
+    "metrics": {
+      "cpu_usage_percent": "anomaly"
+    },
+    "root_cause": "recent_deployment",
+    "expected_action": {
+      "type": "rollback_deployment",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.15,
+    "severity": "high"
+  },
+  {
+    "id": "fs_002",
+    "name": "Memory leak leading to OOM",
+    "description": "Gradual memory leak eventually causes OOM kills",
+    "service": "payment-service",
+    "category": "infrastructure",
+    "metrics": {
+      "memory_usage_percent": "leak"
+    },
+    "root_cause": "memory_leak",
+    "expected_action": {
+      "type": "restart_pod",
+      "level": "L0"
+    },
+    "expected_approval": "auto",
+    "blast_radius": 0.05,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_003",
+    "name": "Database connection pool exhausted",
+    "description": "DB connection pool depletion causing cascading failures",
+    "service": "user-service",
+    "category": "infrastructure",
+    "metrics": {
+      "p99_latency_ms": "degradation",
+      "error_rate_percent": "spike"
+    },
+    "root_cause": "database_connection_pool_exhausted",
+    "expected_action": {
+      "type": "scale_up",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.2,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_004",
+    "name": "Cache failure causing DB overload",
+    "description": "Redis cache failure leads to direct DB queries",
+    "service": "inventory-service",
+    "category": "infrastructure",
+    "metrics": {
+      "p99_latency_ms": "degradation"
+    },
+    "root_cause": "cache_failure",
+    "expected_action": {
+      "type": "restart_pod",
+      "level": "L0"
+    },
+    "expected_approval": "auto",
+    "blast_radius": 0.1,
+    "severity": "high"
+  },
+  {
+    "id": "fs_005",
+    "name": "Configuration error causing high error rate",
+    "description": "Wrong configuration causes services to return errors",
+    "service": "api-gateway",
+    "category": "infrastructure",
+    "metrics": {
+      "error_rate_percent": "spike"
+    },
+    "root_cause": "configuration_error",
+    "expected_action": {
+      "type": "rollback_config",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.25,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_biz_001",
+    "name": "Payment gateway timeout — orders piling up",
+    "description": "Third-party payment gateway timeout causes payment failures and order backlog in order-service",
+    "service": "payment-service",
+    "category": "business",
+    "metrics": {
+      "payment_failure_rate": "spike",
+      "order_backlog_count": "spike"
+    },
+    "root_cause": "third_party_timeout",
+    "expected_action": {
+      "type": "enable_payment_fallback",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.3,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_biz_002",
+    "name": "Order processing stuck — inventory sync failure",
+    "description": "Inventory service returns stale data causing order-processor to deadlock on stock validation",
+    "service": "order-service",
+    "category": "business",
+    "metrics": {
+      "order_backlog_count": "spike"
+    },
+    "root_cause": "inventory_data_stale",
+    "expected_action": {
+      "type": "reconcile_inventory",
+      "level": "L1"
+    },
+    "expected_approval": "team_lead",
+    "blast_radius": 0.25,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_biz_003",
+    "name": "User login failure spike — SSO token cache expired",
+    "description": "Redis cache expires all SSO tokens causing mass login failures across user-service",
+    "service": "user-service",
+    "category": "business",
+    "metrics": {
+      "auth_failure_rate": "spike"
+    },
+    "root_cause": "token_cache_expired",
+    "expected_action": {
+      "type": "enable_static_auth",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.4,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_biz_004",
+    "name": "Rate limiter false-positive — blocking legitimate traffic",
+    "description": "API gateway rate limiter misconfigured, blocking valid user requests during promotion event",
+    "service": "api-gateway",
+    "category": "business",
+    "metrics": {
+      "rate_limit_hit_rate": "spike",
+      "error_rate_percent": "spike"
+    },
+    "root_cause": "rate_limit_misconfig",
+    "expected_action": {
+      "type": "adjust_rate_limit",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.1,
+    "severity": "high"
+  },
+  {
+    "id": "fs_biz_005",
+    "name": "Message queue backlog — consumer group stuck",
+    "description": "Kafka consumer group stuck on corrupted message, causing 5000+ message lag on order-processing topic",
+    "service": "order-service",
+    "category": "business",
+    "metrics": {
+      "mq_consumer_lag": "spike"
+    },
+    "root_cause": "corrupted_message",
+    "expected_action": {
+      "type": "skip_corrupted_message",
+      "level": "L0"
+    },
+    "expected_approval": "auto",
+    "blast_radius": 0.12,
+    "severity": "high"
+  },
+  {
+    "id": "fs_biz_006",
+    "name": "Data inconsistency — DB-ES replication lag",
+    "description": "MySQL-to-Elasticsearch replication lag causes search results to show incorrect inventory counts",
+    "service": "inventory-service",
+    "category": "business",
+    "metrics": {
+      "replication_lag_seconds": "spike"
+    },
+    "root_cause": "replication_lag",
+    "expected_action": {
+      "type": "force_reindex",
+      "level": "L1"
+    },
+    "expected_approval": "team_lead",
+    "blast_radius": 0.15,
+    "severity": "medium"
+  },
+  {
+    "id": "fs_biz_007",
+    "name": "重复扣款 — 支付幂等性失败",
+    "description": "支付回调因网络抖动重试3次，导致用户同一笔订单被扣款3次。依赖 payment_idempotency_key 失效",
+    "service": "payment-service",
+    "category": "business_logic",
+    "business_rules": [
+      "br_duplicate_charge"
+    ],
+    "root_cause": "payment_idempotency_failure",
+    "expected_action": {
+      "type": "refund_duplicates",
+      "level": "L2"
+    },
+    "expected_approval": "team_lead",
+    "blast_radius": 0.05,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_biz_008",
+    "name": "库存超卖 — 并发下单竞态条件",
+    "description": "秒杀活动期间，库存缓存未及时更新，10个用户同时下单成功但实际只剩3件库存",
+    "service": "inventory-service",
+    "category": "business_logic",
+    "business_rules": [
+      "br_oversell"
+    ],
+    "root_cause": "inventory_sync_failure",
+    "expected_action": {
+      "type": "cancel_oversold_orders",
+      "level": "L2"
+    },
+    "expected_approval": "team_lead",
+    "blast_radius": 0.15,
+    "severity": "critical"
+  },
+  {
+    "id": "fs_biz_009",
+    "name": "订单金额对账不平 — 优惠券计算错误",
+    "description": "满减券在多SKU订单中比例分摊计算有精度问题，导致订单总额与实付金额相差0.02元",
+    "service": "order-service",
+    "category": "business_logic",
+    "business_rules": [
+      "br_amount_mismatch"
+    ],
+    "root_cause": "accounting_reconciliation_error",
+    "expected_action": {
+      "type": "reconcile_transactions",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.08,
+    "severity": "high"
+  },
+  {
+    "id": "fs_biz_010",
+    "name": "支付回调丢失 — 订单状态不一致",
+    "description": "支付网关回调 webhook 因证书过期返回 500，导致 50 笔已支付订单仍显示待支付",
+    "service": "payment-service",
+    "category": "business_logic",
+    "business_rules": [
+      "br_payment_callback_loss"
+    ],
+    "root_cause": "third_party_callback_loss",
+    "expected_action": {
+      "type": "reconcile_payment_status",
+      "level": "L1"
+    },
+    "expected_approval": "oncall",
+    "blast_radius": 0.1,
+    "severity": "critical"
+  }
+]

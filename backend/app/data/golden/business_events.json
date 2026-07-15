@@ -1,0 +1,233 @@
+{
+  "normal": {
+    "payment_transactions": [
+      {
+        "user_id": "u_001",
+        "order_id": "ord_1001",
+        "amount": 99.0,
+        "charged_at": "2026-07-01T10:00:00+00:00"
+      },
+      {
+        "user_id": "u_002",
+        "order_id": "ord_1002",
+        "amount": 59.0,
+        "charged_at": "2026-07-01T10:05:00+00:00"
+      }
+    ],
+    "orders": [
+      {
+        "order_id": "ord_1001",
+        "product_id": "sku_100",
+        "quantity": 1,
+        "status": "paid",
+        "amount": 99.0,
+        "updated_at": "2026-07-01T10:01:00+00:00"
+      },
+      {
+        "order_id": "ord_1002",
+        "product_id": "sku_200",
+        "quantity": 2,
+        "status": "paid",
+        "amount": 59.0,
+        "updated_at": "2026-07-01T10:06:00+00:00"
+      }
+    ],
+    "products": [
+      {
+        "product_id": "sku_100",
+        "stock": 50
+      },
+      {
+        "product_id": "sku_200",
+        "stock": 30
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "ord_1001",
+        "status": "success",
+        "amount": 99.0
+      },
+      {
+        "order_id": "ord_1002",
+        "status": "success",
+        "amount": 59.0
+      }
+    ],
+    "coupon_usage": [
+      {
+        "coupon_id": "cp_500",
+        "user_id": "u_001",
+        "used_at": "2026-07-01T09:58:00+00:00"
+      },
+      {
+        "coupon_id": "cp_501",
+        "user_id": "u_002",
+        "used_at": "2026-07-01T10:03:00+00:00"
+      }
+    ]
+  },
+  "fs_biz_007": {
+    "payment_transactions": [
+      {
+        "user_id": "u_100",
+        "order_id": "ord_2001",
+        "amount": 199.0,
+        "charged_at": "2026-07-02T09:00:00+00:00"
+      },
+      {
+        "user_id": "u_100",
+        "order_id": "ord_2001",
+        "amount": 199.0,
+        "charged_at": "2026-07-02T09:01:10+00:00"
+      },
+      {
+        "user_id": "u_100",
+        "order_id": "ord_2001",
+        "amount": 199.0,
+        "charged_at": "2026-07-02T09:02:30+00:00"
+      }
+    ]
+  },
+  "fs_biz_008": {
+    "orders": [
+      {
+        "order_id": "ord_3000",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "paid",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3001",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "processing",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3002",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "paid",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3003",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "processing",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3004",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "paid",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3005",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "processing",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3006",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "paid",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3007",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "processing",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3008",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "paid",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      },
+      {
+        "order_id": "ord_3009",
+        "product_id": "sku_flash",
+        "quantity": 1,
+        "status": "processing",
+        "amount": 39.0,
+        "updated_at": "2026-07-03T12:00:00+00:00"
+      }
+    ],
+    "products": [
+      {
+        "product_id": "sku_flash",
+        "stock": 3
+      }
+    ]
+  },
+  "fs_biz_009": {
+    "orders": [
+      {
+        "order_id": "ord_4001",
+        "product_id": "sku_100",
+        "quantity": 3,
+        "status": "paid",
+        "amount": 100.0,
+        "updated_at": "2026-07-04T15:00:00+00:00"
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "ord_4001",
+        "status": "success",
+        "amount": 99.98
+      }
+    ]
+  },
+  "fs_biz_010": {
+    "payments": [
+      {
+        "order_id": "ord_5001",
+        "status": "success",
+        "amount": 59.0
+      },
+      {
+        "order_id": "ord_5002",
+        "status": "success",
+        "amount": 89.0
+      }
+    ],
+    "orders": [
+      {
+        "order_id": "ord_5001",
+        "product_id": "sku_200",
+        "quantity": 1,
+        "status": "pending_payment",
+        "amount": 59.0,
+        "updated_at": "2026-07-05T08:00:00+00:00"
+      },
+      {
+        "order_id": "ord_5002",
+        "product_id": "sku_200",
+        "quantity": 1,
+        "status": "pending_payment",
+        "amount": 89.0,
+        "updated_at": "2026-07-05T08:02:00+00:00"
+      }
+    ]
+  }
+}

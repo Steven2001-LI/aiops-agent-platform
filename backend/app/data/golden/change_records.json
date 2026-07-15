@@ -1,0 +1,37 @@
+[
+  {
+    "service": "order-service",
+    "type": "deployment",
+    "author": "developer-a",
+    "description": "Update order processing logic",
+    "minutes_ago": 45
+  },
+  {
+    "service": "payment-service",
+    "type": "config_change",
+    "author": "developer-b",
+    "description": "Increase timeout settings",
+    "minutes_ago": 30
+  },
+  {
+    "service": "user-service",
+    "type": "deployment",
+    "author": "developer-c",
+    "description": "Add new authentication flow",
+    "minutes_ago": 180
+  },
+  {
+    "service": "api-gateway",
+    "type": "config_change",
+    "author": "developer-a",
+    "description": "Update rate limiting rules",
+    "minutes_ago": 210
+  },
+  {
+    "service": "inventory-service",
+    "type": "deployment",
+    "author": "developer-d",
+    "description": "Optimize query performance",
+    "minutes_ago": 1200
+  }
+]
