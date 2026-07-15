@@ -29,8 +29,10 @@ Candidate Evaluation 不会在 Incident Pipeline 结束后自动运行；需要�
 
 ```mermaid
 flowchart TB
-    subgraph HTTP["HTTP Demo Pipeline（当前 API 实际执行路径，手写顺序管道）"]
-        A[Incident 告警触发] --> M[Monitor Agent<br/>多算法投票异常检测]
+    A[Incident 告警触发] --> D{APP_PIPELINE_ENGINE}
+
+    subgraph HTTP["Legacy Pipeline（默认）"]
+        D -->|legacy| M[Monitor Agent<br/>多算法投票异常检测]
         M --> R[RCA Agent<br/>混合根因分析]
         R --> H[Heal Agent<br/>Playbook 匹配 + Dry-Run]
         H --> C[Change Agent<br/>风险评分 / 审批门控]
@@ -39,8 +41,9 @@ flowchart TB
         M & R & H & C -->|任一阶段失败| E[人工升级 ESCALATED]
     end
 
-    subgraph LG["Independent LangGraph State Machine（独立演示路径，非 HTTP 执行器）"]
-        GS[Shared GraphState] --> CR[Conditional Routing<br/>decide_action / after_heal / after_approval]
+    subgraph LG["LangGraph Pipeline（可选）"]
+        D -->|langgraph| GS[Shared GraphState]
+        GS --> CR[Conditional Routing<br/>decide_action / after_heal / after_approval]
         CR -->|失败| HE[Human Escalation]
         CR -->|审批通过| SR[Simulated Resolution]
         CR -->|pending| PE[合法暂停终态]
@@ -63,7 +66,7 @@ flowchart TB
 | Dry-Run 恢复规划 | Playbook 匹配、逐动作 Dry-Run 模拟、爆炸半径评估、L0/L1/L2 分级自愈、熔断器保护 | [`backend/app/agents/heal_agent.py`](backend/app/agents/heal_agent.py) |
 | 风险评分与审批门控 | 五因素加权风险评分（爆炸半径/历史成功率/时间因素/服务等级/变更类型），分级审批与审计日志 | [`backend/app/agents/change_agent.py`](backend/app/agents/change_agent.py) |
 | LangGraph 条件状态机 | `StateGraph` + 条件边路由：失败升级 / pending 暂停 / 审批通过验证，终态与 incident 状态一致性校验 | [`backend/app/agents/orchestrator.py`](backend/app/agents/orchestrator.py) |
-| 三层记忆系统 | 短期/长期/工作记忆流转与归档，ChromaDB 本地持久化向量检索 | [`backend/app/memory/core.py`](backend/app/memory/core.py) |
+| 三层记忆系统 | 短期/长期/工作记忆流转与归档，ChromaDB 嵌入式/独立服务双模式向量检索 | [`backend/app/memory/core.py`](backend/app/memory/core.py) |
 | Candidate Evaluation | 端到端/推理/工具调用/RAG 四维度规则指标，可选 LLM-as-Judge 融合（规则分 0.6 + Judge 分 0.4） | [`backend/app/agents/eval_agent.py`](backend/app/agents/eval_agent.py) |
 | NLU 快慢路径 | 正则快路径 + LLM 慢路径（置信度阈值切换），自然语言 → 意图/实体/诊断计划 | [`backend/app/nlu/hybrid.py`](backend/app/nlu/hybrid.py) |
 
@@ -99,6 +102,16 @@ cd backend
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
+ruff check app
+```
+
+**前端质量检查与构建**：
+
+```bash
+cd frontend
+npm ci
+npm run lint
+npm run build
 ```
 
 注意：Compose 默认值已使用 JSON 字符串数组；如果创建 `backend/.env` 并自定义 CORS，也必须使用相同格式（逗号分隔字符串会导致 pydantic-settings 解析 list 字段失败）：
@@ -125,7 +138,7 @@ docker compose up -d   # backend :8000 / frontend :8080
 说明：
 
 - `docker-compose.yml` 默认 `APP_ENV=production`；`/docs`、`/redoc` 与 `/openapi.json` 仅在 `APP_ENV=development` 时开放，生产环境关闭。
-- Compose 中的 `chroma` 容器只是编排预留：主代码当前使用 ChromaDB 本地 `PersistentClient`（见 [`backend/app/memory/storage.py`](backend/app/memory/storage.py)），并未连接该独立 Chroma 服务。
+- Chroma 支持双模式：本地开发未设置 `CHROMA_HOST` 时使用嵌入式 `PersistentClient`；Compose 已设置 `CHROMA_HOST=chroma`，后端会通过 `HttpClient` 连接独立 Chroma 服务。
 - 当前主 LLM 配置读取 `LLM_API_KEY` / `LLM_PROVIDER` / `LLM_MODEL`；Compose 保留的 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` 兼容透传项不会被当前主 `LLMService` 自动读取。Compose 不透传 `LLM_ENABLE_RCA/NLU/JUDGE` 功能开关——只填 Key 不会自动启用全部 LLM 功能。
 
 ## Rule-only 与 Optional LLM 模式
@@ -155,8 +168,7 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 以下数据为演示或合成数据，非真实系统采集：
 
 - 故障场景、指标时序、服务拓扑、知识库与 Playbook：内置数据集（[`backend/app/data/datasets.py`](backend/app/data/datasets.py)、[`backend/app/data/knowledge_base.py`](backend/app/data/knowledge_base.py)、[`backend/app/data/playbooks.py`](backend/app/data/playbooks.py)）。
-- `/api/v1/agents` 与 `/api/v1/agents/{id}/status` 返回的执行次数、成功率为预设演示值。
-- `/api/v1/evaluations` 列表返回静态示例评估记录；`/api/v1/topology` 中节点 CPU/内存/延迟为模拟值。
+- `/api/v1/topology` 中节点健康状态为预设演示值；节点 CPU/内存/延迟取自内置模拟数据集的 normal 场景（数据层节点无数据集时如实返回 null）。
 - 前端仪表盘的初始 incident 与统计数据为预置演示状态（[`frontend/src/store/useAppStore.ts`](frontend/src/store/useAppStore.ts)）。
 - 演示故障数据（7 条预置事故）由 `APP_ENABLE_DEMO_SEED` 开关控制，默认关闭：开启后启动时自动注入，`/api/v1/incidents/seed-demo` 端点亦可手动触发；关闭时端点返回 403。`docker-compose.dev.yml` 演示栈显式开启。
 
@@ -187,7 +199,7 @@ aiops-agent-platform/
 │   │   ├── api/             # REST 路由（含 HTTP 顺序管道）/ WebSocket / Webhook
 │   │   ├── data/            # 内置模拟数据集、知识库、Playbook
 │   │   ├── evaluation/      # 四维度评测框架与指标
-│   │   ├── memory/          # 三层记忆系统 + ChromaDB 本地存储
+│   │   ├── memory/          # 三层记忆系统 + ChromaDB 双模式存储
 │   │   ├── nlu/             # 意图识别 / 实体抽取 / 指标映射 / 快慢路径
 │   │   ├── services/        # LLM 服务 / Langfuse / Incident 服务
 │   │   ├── config.py        # pydantic-settings 分组配置
@@ -206,7 +218,7 @@ aiops-agent-platform/
 - **Agent 编排**：手写顺序管道（默认引擎）· LangGraph 状态机（`APP_PIPELINE_ENGINE=langgraph` 切换）
 - **算法**：NumPy · scikit-learn（Isolation Forest）· 贝叶斯推理 · BFS 拓扑遍历
 - **LLM（可选）**：OpenAI 兼容 SDK（OpenAI / DeepSeek），结构化输出 + 规则降级
-- **存储**：ChromaDB（本地 PersistentClient）· SQLite
+- **存储**：ChromaDB（嵌入式 PersistentClient / 独立 HttpClient）· SQLite
 - **可观测性**：Prometheus 指标 · Langfuse 埋点（可选）
 - **前端**：React 18 · TypeScript · Vite · Tailwind CSS · Zustand
 - **测试 / 部署**：pytest · pytest-asyncio · Docker · Docker Compose
