@@ -387,3 +387,140 @@ class TestRCAAgent:
         assert "rca_event" in result.output_data
         assert "bayesian_results" in result.output_data
         assert "impact_services_count" in result.output_data
+
+
+class TestFindRecentChanges:
+    """近期变更双源查询:平台 ChangeEvent 史(源1) + CHANGE_RECORDS 数据集兜底(源2)"""
+
+    @staticmethod
+    def _make_incident_with_change(
+        service: str,
+        minutes_ago: int,
+        change_type: str = "auto_heal",
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from app.models.events import ApprovalStatus, ChangeEvent
+        from app.models.incident import Incident
+
+        alert = AlertEvent(
+            service=service,
+            metric="cpu_usage_percent",
+            value=95.0,
+            threshold=80.0,
+            severity=SeverityLevel.HIGH,
+        )
+        incident = Incident.from_alert(alert)
+        incident.change_events.append(
+            ChangeEvent(
+                incident_id=incident.incident_id,
+                change_id="CHG-TEST-1",
+                change_type=change_type,
+                approval_status=ApprovalStatus.AUTO_APPROVED,
+                risk_score=0.2,
+                risk_level="low",
+                automated_decision_reason="test change",
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+            )
+        )
+        return incident
+
+    @pytest.fixture
+    def isolated_service(self, tmp_path):
+        """隔离的 IncidentService 实例,不碰全局单例与真实 SQLITE_PATH"""
+        from app.services.incident_service import IncidentService
+
+        return IncidentService(db_path=str(tmp_path / "changes.db"))
+
+    def test_incident_history_source(self, isolated_service) -> None:
+        """平台自产 ChangeEvent 史进入近期变更(source=incident_history)"""
+        agent = RCAAgent(incident_service=isolated_service)
+        incident = self._make_incident_with_change("payment-service", minutes_ago=10)
+        isolated_service._incidents[incident.incident_id] = incident
+
+        changes = agent._find_recent_changes("payment-service")
+        history = [c for c in changes if c["source"] == "incident_history"]
+        assert history, f"expected incident_history entries, got {changes}"
+        assert history[0]["change_id"] == "CHG-TEST-1"
+        assert history[0]["status"] == "auto_approved"
+        assert history[0]["type"] == "auto_heal"
+
+    def test_lookback_window(self, isolated_service) -> None:
+        """时间窗过滤:2 小时前的变更在 60 分钟窗外、180 分钟窗内"""
+        agent = RCAAgent(incident_service=isolated_service)
+        incident = self._make_incident_with_change("payment-service", minutes_ago=120)
+        isolated_service._incidents[incident.incident_id] = incident
+
+        within_60 = [
+            c for c in agent._find_recent_changes("payment-service", lookback_minutes=60)
+            if c["source"] == "incident_history"
+        ]
+        within_180 = [
+            c for c in agent._find_recent_changes("payment-service", lookback_minutes=180)
+            if c["source"] == "incident_history"
+        ]
+        assert not within_60
+        assert within_180
+
+    def test_exclude_self(self, isolated_service) -> None:
+        """当前正在分析的事故自身的变更不作为'历史'证据"""
+        agent = RCAAgent(incident_service=isolated_service)
+        incident = self._make_incident_with_change("payment-service", minutes_ago=5)
+        isolated_service._incidents[incident.incident_id] = incident
+
+        history = [
+            c
+            for c in agent._find_recent_changes(
+                "payment-service", exclude_incident_id=incident.incident_id
+            )
+            if c["source"] == "incident_history"
+        ]
+        assert not history
+
+    def test_dataset_fallback(self, isolated_service) -> None:
+        """无平台变更史时,CHANGE_RECORDS 数据集(模拟 CMDB)兜底;未知服务返回空"""
+        agent = RCAAgent(incident_service=isolated_service)
+
+        changes = agent._find_recent_changes("order-service")
+        assert changes, "order-service 应有数据集兜底变更"
+        assert all(c["source"] == "change_records" for c in changes)
+        assert any(c["type"] == "deployment" for c in changes)
+
+        assert agent._find_recent_changes("redis-cache") == []
+
+    def test_changes_sorted_and_capped(self, isolated_service) -> None:
+        """双源合并按时间倒序,最多 5 条"""
+        agent = RCAAgent(incident_service=isolated_service)
+        for i in range(6):
+            incident = self._make_incident_with_change("order-service", minutes_ago=i + 1)
+            isolated_service._incidents[incident.incident_id] = incident
+
+        changes = agent._find_recent_changes("order-service")
+        assert len(changes) == 5
+        times = [c["time"] for c in changes]
+        assert times == sorted(times, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_process_evidence_contains_related_changes(
+        self, isolated_service
+    ) -> None:
+        """消费闭环:evidence.impact_chain_detail 序列化出 related_changes"""
+        agent = RCAAgent(incident_service=isolated_service)
+        alert = AlertEvent(
+            service="order-service",
+            metric="cpu_usage_percent",
+            value=95.0,
+            threshold=80.0,
+            severity=SeverityLevel.HIGH,
+        )
+        result = await agent.process(
+            RCAInput(alert=alert, incident_id="test-incident-changes"),
+            AgentExecutionContext(incident_id="test-incident-changes", input_data={}),
+        )
+
+        assert result.success is True
+        detail = result.output_data["rca_event"]["evidence"]["impact_chain_detail"]
+        assert all("related_changes" in entry for entry in detail)
+        order_entry = next(e for e in detail if e["service"] == "order-service")
+        assert isinstance(order_entry["related_changes"], list)
+        assert len(order_entry["related_changes"]) <= 3

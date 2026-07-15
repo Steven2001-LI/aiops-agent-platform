@@ -13,7 +13,7 @@ import json
 import re
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from prometheus_client import Counter
@@ -21,12 +21,16 @@ from pydantic import BaseModel, Field
 
 from app.agents.base import AgentResult, BaseAgent
 from app.config import get_config
+from app.data.datasets import get_change_records
 from app.data.knowledge_base import KNOWLEDGE_BASE, SERVICE_TOPOLOGY
 from app.models.agent import AgentExecutionContext
-from app.models.events import AlertEvent, RCAEvent, SeverityLevel
+from app.models.events import AlertEvent, RCAEvent
 from app.models.memory import MemoryType
 from app.services.llm_service import LLMService, LLMUnavailableError, get_llm_service
 from app.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from app.services.incident_service import IncidentService
 
 logger = get_logger(__name__)
 
@@ -185,11 +189,18 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
     # 否则超时注入的 CancelledError 会绕过 LLMUnavailableError 降级分支
     LLM_SYNTHESIS_TIMEOUT_SECONDS: float = 30.0
 
-    def __init__(self, llm_service: LLMService | None = None) -> None:
+    def __init__(
+        self,
+        llm_service: LLMService | None = None,
+        incident_service: IncidentService | None = None,
+    ) -> None:
         """
         Args:
             llm_service: 显式注入的 LLM 服务（测试路径）；
                          None 时在首次使用时懒加载全局单例（生产路径）。
+            incident_service: 显式注入的故障服务（测试路径）；
+                         None 时在首次使用时懒加载全局单例（生产路径）,
+                         供近期变更检查读取平台自产 ChangeEvent 史。
         """
         super().__init__()
         self._service_topology = SERVICE_TOPOLOGY
@@ -200,6 +211,14 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         # 开关分支依据：_resolve_llm_service 懒加载会把全局单例写回 _llm_service，
         # 用 "is not None" 判注入与否，首次 LLM 调用后生产路径会退化成配置快照
         self._llm_injected: bool = llm_service is not None
+        self._incident_service: IncidentService | None = incident_service
+
+    def _resolve_incident_service(self) -> IncidentService:
+        """懒加载全局单例(与 llm_service 同模式,不在 __init__ 快照)。"""
+        if self._incident_service is None:
+            from app.services.incident_service import get_incident_service
+            self._incident_service = get_incident_service()
+        return self._incident_service
 
     async def _get_memory_system(self):
         """惰性初始化 MemorySystem，失败后不再重试。"""
@@ -251,6 +270,8 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         impact_chain = self.bfs_traverse(
             alert.service,
             max_hops=input_data.max_hops,
+            lookback_minutes=input_data.lookback_minutes,
+            exclude_incident_id=input_data.incident_id,
         )
 
         # Step 2: 贝叶斯推理
@@ -362,6 +383,8 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
                         "hop": i.hop_distance,
                         "tier": i.tier,
                         "impact_level": i.impact_level,
+                        # 截断控响应体积:每服务最多 3 条近期变更
+                        "related_changes": i.related_changes[:3],
                     }
                     for i in impact_chain
                 ],
@@ -401,6 +424,8 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         self,
         start_service: str,
         max_hops: int = 3,
+        lookback_minutes: int = 60,
+        exclude_incident_id: str = "",
     ) -> list[ServiceImpact]:
         """
         BFS 遍历服务依赖链
@@ -410,6 +435,8 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
         Args:
             start_service: 起始服务名称
             max_hops: 最大跳数
+            lookback_minutes: 近期变更检查的时间窗(分钟)
+            exclude_incident_id: 变更史查询排除的事故(当前正在分析的自身)
 
         Returns:
             list[ServiceImpact]: 影响链路中的服务列表
@@ -436,8 +463,10 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
 
             impact = self._create_impact_entry(service, hop)
 
-            # 查找相关变更（模拟）
-            impact.related_changes = self._find_recent_changes(service)
+            # 查找相关变更（双源:平台 ChangeEvent 史 + CMDB 模拟数据集兜底）
+            impact.related_changes = self._find_recent_changes(
+                service, lookback_minutes, exclude_incident_id
+            )
 
             # 根据跳数确定影响级别
             if hop == 0:
@@ -483,25 +512,51 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
             tier=svc_info.get("tier", "standard"),
         )
 
-    def _find_recent_changes(self, service: str) -> list[dict[str, Any]]:
+    def _find_recent_changes(
+        self,
+        service: str,
+        lookback_minutes: int = 60,
+        exclude_incident_id: str = "",
+    ) -> list[dict[str, Any]]:
         """
-        查找服务的近期变更（模拟数据）
+        查找服务在时间窗内的近期变更（双源合并,按时间倒序,最多 5 条）
 
-        在生产环境中，这应查询 CMDB/发布系统。
+        源1 incident_history: 平台自产的 ChangeEvent 史(IncidentService
+             内存主副本,经 SQLite 恢复跨重启有效) — 真实运行数据;
+        源2 change_records: CHANGE_RECORDS 数据集(模拟 CMDB/发布系统的
+             静态兜底,与 knowledge_tools.get_recent_changes 同源)。
         """
-        # 模拟变更数据
-        changes: dict[str, list[dict[str, Any]]] = {
-            "order-service": [
-                {"type": "deployment", "time": "2024-01-15T10:30:00Z", "version": "v2.3.1"},
-            ],
-            "payment-service": [
-                {"type": "config_change", "time": "2024-01-15T09:00:00Z", "description": "connection pool size"},
-            ],
-            "mysql-primary": [
-                {"type": "maintenance", "time": "2024-01-14T22:00:00Z", "description": "index optimization"},
-            ],
-        }
-        return changes.get(service, [])
+        since = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+        changes: list[dict[str, Any]] = []
+
+        try:
+            changes.extend(
+                self._resolve_incident_service().list_change_events(
+                    service, since, exclude_incident_id
+                )
+            )
+        except Exception as e:
+            # 变更史只是辅助证据,查询失败不阻断 RCA 主流程
+            logger.warning("Incident change history unavailable", error=str(e))
+
+        for r in get_change_records(service):
+            ts = str(r.get("timestamp", ""))
+            try:
+                t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                t = None
+            if t is not None and t < since:
+                continue
+            changes.append({
+                "type": r.get("type", ""),
+                "time": ts,
+                "author": r.get("author", ""),
+                "description": r.get("description", ""),
+                "source": "change_records",
+            })
+
+        changes.sort(key=lambda c: str(c.get("time", "")), reverse=True)
+        return changes[:5]
 
     # ==================== 贝叶斯推理 ====================
 
@@ -1003,7 +1058,9 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
             },
             "E1_topology_impact": [
                 {"service": i.service, "hop": i.hop_distance,
-                 "tier": i.tier, "level": i.impact_level}
+                 "tier": i.tier, "level": i.impact_level,
+                 # 每服务最多 2 条,控 prompt token
+                 "recent_changes": i.related_changes[:2]}
                 for i in impact_chain[:10]
             ],
             "E2_bayesian_top5": [

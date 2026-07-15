@@ -8,6 +8,7 @@ AIOps Agent Platform - Test Datasets
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # ============================================================
@@ -314,42 +315,53 @@ FAULT_SCENARIOS: list[dict[str, Any]] = [
 ]
 
 # ============================================================
-# 变更记录数据集
+# 变更记录数据集(模拟 CMDB/发布系统)
 # ============================================================
+# 时间戳相对进程启动时刻生成:此前是写死的 2024-01 固定日期,
+# 消费方(RCA 近期变更检查 / knowledge_tools.get_recent_changes)的
+# "最近 N 分钟"时间窗过滤对固定旧日期恒为空,"近期"语义是假的。
+# 偏移保持原数据的先后顺序;order-service 的 deployment 保持在
+# 默认 60 分钟窗口内(RCA 知识库 deployment_issue 加成依赖它)。
+
+
+def _change_ts(minutes_ago: int) -> str:
+    """生成相对当前时刻的 ISO 时间戳(aware UTC)。"""
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
 
 CHANGE_RECORDS: list[dict[str, Any]] = [
     {
         "service": "order-service",
         "type": "deployment",
-        "timestamp": "2024-01-15T10:30:00Z",
+        "timestamp": _change_ts(45),
         "author": "developer-a",
         "description": "Update order processing logic",
     },
     {
         "service": "payment-service",
         "type": "config_change",
-        "timestamp": "2024-01-15T11:00:00Z",
+        "timestamp": _change_ts(30),
         "author": "developer-b",
         "description": "Increase timeout settings",
     },
     {
         "service": "user-service",
         "type": "deployment",
-        "timestamp": "2024-01-15T09:00:00Z",
+        "timestamp": _change_ts(180),
         "author": "developer-c",
         "description": "Add new authentication flow",
     },
     {
         "service": "api-gateway",
         "type": "config_change",
-        "timestamp": "2024-01-15T08:30:00Z",
+        "timestamp": _change_ts(210),
         "author": "developer-a",
         "description": "Update rate limiting rules",
     },
     {
         "service": "inventory-service",
         "type": "deployment",
-        "timestamp": "2024-01-14T16:00:00Z",
+        "timestamp": _change_ts(20 * 60),
         "author": "developer-d",
         "description": "Optimize query performance",
     },

@@ -157,6 +157,40 @@ class IncidentService:
         """
         return self._incidents.get(incident_id)
 
+    def list_change_events(
+        self,
+        service: str,
+        since: datetime,
+        exclude_incident_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """按服务查询平台自产的变更事件史(RCA 近期变更证据源)。
+
+        读路径全在内存主副本(SQLite 仅为落盘副本,经 load_all 恢复,
+        跨重启有效),与 list() 一致,不要改成查库。
+        exclude_incident_id 用于排除当前正在分析的事故自身。
+        """
+        records: list[dict[str, Any]] = []
+        for incident in self._incidents.values():
+            if incident.service != service:
+                continue
+            if exclude_incident_id and incident.incident_id == exclude_incident_id:
+                continue
+            for ce in incident.change_events:
+                if ce.timestamp < since:
+                    continue
+                records.append({
+                    "type": ce.change_type or "auto_heal",
+                    "time": ce.timestamp.isoformat(),
+                    "change_id": ce.change_id,
+                    "status": ce.approval_status.value,
+                    "risk_level": ce.risk_level,
+                    "description": ce.automated_decision_reason
+                    or str(ce.change_details.get("heal_action", "")),
+                    "source": "incident_history",
+                })
+        records.sort(key=lambda r: r["time"], reverse=True)
+        return records
+
     async def update_state(
         self,
         incident_id: str,
