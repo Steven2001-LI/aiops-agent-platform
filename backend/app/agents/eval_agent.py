@@ -106,6 +106,9 @@ class ReasoningMetrics(BaseModel):
     """推理评估指标"""
 
     root_cause_accuracy: float = Field(default=0.0, description="根因准确率")
+    # Top-K 命中率:真值在候选根因前 3 位即命中(与 root_cause_accuracy 同一
+    # 精确串比较口径);只报告不参与 overall_score,保持基线口径稳定
+    root_cause_top3_hit_rate: float = Field(default=0.0, description="根因 Top-3 命中率")
     confidence_calibration_error: float = Field(default=0.0, description="置信度校准误差")
     confidence_calibration_score: float = Field(default=0.0, description="置信度校准得分")
     impact_chain_precision: float = Field(default=0.0, description="影响链精确率")
@@ -154,6 +157,49 @@ class RAGMetrics(BaseModel):
     )
 
 
+class LatencyMetrics(BaseModel):
+    """处理延迟指标(秒)。
+
+    测量维度而非 0-1 质量分,永不进 overall_score。数据源是 Incident.timeline
+    状态转移时间戳差分——IncidentMetrics.time_to_*/resolved_at 全库无写入点
+    (死字段),禁止用作延迟数据源。
+    """
+
+    end_to_end_seconds_mean: float = Field(default=0.0, description="端到端耗时均值")
+    end_to_end_seconds_p50: float = Field(default=0.0, description="端到端耗时 P50")
+    end_to_end_seconds_p95: float = Field(default=0.0, description="端到端耗时 P95")
+    ack_seconds_mean: float = Field(default=0.0, description="接收确认耗时均值")
+    rca_seconds_mean: float = Field(default=0.0, description="RCA 阶段耗时均值")
+    heal_to_terminal_seconds_mean: float = Field(
+        default=0.0, description="修复演习到终态耗时均值(含审批等待)"
+    )
+    incidents_measured: int = Field(default=0, description="可测事故数")
+    # AWAITING_APPROVAL 暂停后人工恢复的事故,端到端耗时含人工等待;
+    # 按终态分桶呈现避免误读
+    terminal_state_breakdown: dict[str, int] = Field(
+        default_factory=dict, description="终态分布"
+    )
+
+
+class CostMetrics(BaseModel):
+    """LLM token 成本指标。
+
+    测量维度,永不进 overall_score。来源:RCA llm_hybrid 产物的
+    evidence.llm_meta 与 LLM-as-Judge 的 llm_meta。LLM 全关(默认)时
+    无任何来源,维度按 not_applicable 呈现。
+    """
+
+    total_input_tokens: int = Field(default=0, description="输入 token 总量")
+    total_output_tokens: int = Field(default=0, description="输出 token 总量")
+    total_tokens: int = Field(default=0, description="token 总量")
+    llm_calls: int = Field(default=0, description="LLM 调用来源数")
+    avg_tokens_per_call: float = Field(default=0.0, description="平均每来源 token")
+    avg_llm_latency_ms: float = Field(default=0.0, description="平均 LLM 延迟(ms)")
+    by_source: dict[str, dict[str, Any]] = Field(
+        default_factory=dict, description="按来源分桶(rca/judge)"
+    )
+
+
 class EvalReport(BaseModel):
     """评估报告"""
 
@@ -168,6 +214,9 @@ class EvalReport(BaseModel):
     reasoning: ReasoningMetrics = Field(default_factory=ReasoningMetrics)
     tool_call: ToolCallMetrics = Field(default_factory=ToolCallMetrics)
     rag: RAGMetrics = Field(default_factory=RAGMetrics)
+    # 测量维度(latency/cost):只呈现不计分,不参与 overall_score
+    latency: LatencyMetrics = Field(default_factory=LatencyMetrics)
+    cost: CostMetrics = Field(default_factory=CostMetrics)
     overall_score: float = Field(default=0.0, description="综合得分")
     recommendations: list[str] = Field(default_factory=list, description="改进建议")
     raw_details: dict[str, Any] = Field(default_factory=dict, description="原始详情")
@@ -291,6 +340,19 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
             if input_data.eval_type in (EvalType.RAG, EvalType.FULL):
                 report.rag = self._eval_rag(input_data)
+
+            # 测量维度(不进 overall_score):latency 挂 e2e 请求面,
+            # cost 挂 reasoning 请求面(RCA 与 Judge 是仅有的 LLM 调用源);
+            # cost 必须在 _maybe_judge_reasoning 之后算,否则漏计 judge token
+            if input_data.eval_type in (EvalType.END_TO_END, EvalType.FULL):
+                report.latency = self._eval_latency(input_data)
+            if input_data.eval_type in (EvalType.REASONING, EvalType.FULL):
+                judge_meta = (
+                    report.reasoning.judge.get("llm_meta")
+                    if report.reasoning.judge
+                    else None
+                )
+                report.cost = self._eval_cost(input_data, judge_meta)
 
             report.score_coverage = self._build_score_coverage(input_data, report)
 
@@ -535,6 +597,141 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
     # ==================== 推理评估 ====================
 
+    @staticmethod
+    def _timeline_to_latency_sample(incident: Incident) -> dict[str, Any] | None:
+        """从 Incident.timeline 状态转移时间戳差分出延迟样本。
+
+        返回 None 的样本不可测:演示种子事故(时间线是种子化瞬间伪造的,
+        created_at 被回拨)与时间线不足 2 条的事故。
+        禁止改用 IncidentMetrics.time_to_*/resolved_at——全库无写入点,恒 0/None。
+        """
+        # getattr 防御:路由层测试会注入只带部分属性的假 incident
+        alert = getattr(incident, "alert_event", None)
+        if alert is not None and getattr(alert, "annotations", {}).get("seed") == "true":
+            return None
+        timeline = sorted(
+            getattr(incident, "timeline", None) or [], key=lambda e: e.timestamp
+        )
+        if len(timeline) < 2:
+            return None
+
+        first_seen: dict[str, Any] = {}
+        for entry in timeline:
+            state = entry.state.value if hasattr(entry.state, "value") else str(entry.state)
+            first_seen.setdefault(state, entry.timestamp)
+
+        def span(start_state: str, end_state: str) -> float | None:
+            start = first_seen.get(start_state)
+            end = first_seen.get(end_state)
+            if start is None or end is None or end < start:
+                return None
+            return (end - start).total_seconds()
+
+        terminal_state = next(
+            (s for s in ("resolved", "closed", "escalated") if s in first_seen), None
+        )
+        start_ts = timeline[0].timestamp
+        end_to_end = (
+            (first_seen[terminal_state] - start_ts).total_seconds()
+            if terminal_state
+            else None
+        )
+        heal_to_terminal = (
+            span("healing", terminal_state) if terminal_state else None
+        )
+        return {
+            "id": getattr(incident, "incident_id", ""),
+            "stages": {
+                "ack": span(timeline[0].state.value if hasattr(timeline[0].state, "value") else str(timeline[0].state), "acknowledged"),
+                "rca": span("rca_in_progress", "rca_completed"),
+                "heal_to_terminal": heal_to_terminal,
+            },
+            "end_to_end_seconds": end_to_end,
+            "terminal_state": terminal_state,
+        }
+
+    def _eval_latency(self, input_data: EvalInput) -> LatencyMetrics:
+        """聚合 samples_by_type['latency'] 的逐事故延迟样本(逐指标独立分母)。"""
+        samples = input_data.samples_by_type.get("latency") or []
+        e2e = [
+            s["end_to_end_seconds"]
+            for s in samples
+            if s.get("end_to_end_seconds") is not None
+        ]
+        acks = [s["stages"]["ack"] for s in samples if s.get("stages", {}).get("ack") is not None]
+        rcas = [s["stages"]["rca"] for s in samples if s.get("stages", {}).get("rca") is not None]
+        heals = [
+            s["stages"]["heal_to_terminal"]
+            for s in samples
+            if s.get("stages", {}).get("heal_to_terminal") is not None
+        ]
+        breakdown: dict[str, int] = {}
+        for s in samples:
+            terminal = s.get("terminal_state")
+            if terminal:
+                breakdown[terminal] = breakdown.get(terminal, 0) + 1
+
+        return LatencyMetrics(
+            end_to_end_seconds_mean=round(float(np.mean(e2e)), 3) if e2e else 0.0,
+            end_to_end_seconds_p50=round(float(np.percentile(e2e, 50)), 3) if e2e else 0.0,
+            end_to_end_seconds_p95=round(float(np.percentile(e2e, 95)), 3) if e2e else 0.0,
+            ack_seconds_mean=round(float(np.mean(acks)), 3) if acks else 0.0,
+            rca_seconds_mean=round(float(np.mean(rcas)), 3) if rcas else 0.0,
+            heal_to_terminal_seconds_mean=round(float(np.mean(heals)), 3) if heals else 0.0,
+            incidents_measured=len(samples),
+            terminal_state_breakdown=breakdown,
+        )
+
+    def _eval_cost(
+        self, input_data: EvalInput, judge_meta: dict[str, Any] | None
+    ) -> CostMetrics:
+        """聚合 LLM token 用量:RCA llm_hybrid 的 evidence.llm_meta + Judge llm_meta。
+
+        必须在 _maybe_judge_reasoning 之后调用,否则 judge token 漏计。
+        """
+        buckets: dict[str, dict[str, Any]] = {}
+
+        def add(source: str, meta: dict[str, Any]) -> None:
+            usage = meta.get("usage") or {}
+            bucket = buckets.setdefault(
+                source,
+                {"input": 0, "output": 0, "total": 0, "calls": 0,
+                 "latency_ms_sum": 0.0, "model": meta.get("model", "")},
+            )
+            bucket["input"] += int(usage.get("input", 0))
+            bucket["output"] += int(usage.get("output", 0))
+            bucket["total"] += int(usage.get("total", 0))
+            bucket["calls"] += 1
+            bucket["latency_ms_sum"] += float(meta.get("latency_ms", 0.0))
+
+        for result in input_data.agent_results:
+            if result.get("agent_name") != "rca_agent":
+                continue
+            rca_event = result.get("output_data", {}).get("rca_event", {})
+            meta = rca_event.get("evidence", {}).get("llm_meta")
+            if isinstance(meta, dict):
+                add("rca", meta)
+        if isinstance(judge_meta, dict):
+            add("judge", judge_meta)
+
+        total_input = sum(b["input"] for b in buckets.values())
+        total_output = sum(b["output"] for b in buckets.values())
+        total = sum(b["total"] for b in buckets.values())
+        calls = sum(b["calls"] for b in buckets.values())
+        latency_sum = sum(b["latency_ms_sum"] for b in buckets.values())
+        return CostMetrics(
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            total_tokens=total,
+            llm_calls=calls,
+            avg_tokens_per_call=round(total / calls, 1) if calls else 0.0,
+            avg_llm_latency_ms=round(latency_sum / calls, 1) if calls else 0.0,
+            by_source={
+                name: {k: v for k, v in bucket.items() if k != "latency_ms_sum"}
+                for name, bucket in buckets.items()
+            },
+        )
+
     def _eval_reasoning(self, input_data: EvalInput) -> ReasoningMetrics:
         """
         推理评估
@@ -568,6 +765,21 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             sum(1 for matched in root_matches if matched) / len(root_matches)
             if root_matches
             else 0.0
+        )
+
+        # Top-3 命中率:真值在候选根因前 3 位即命中(与 root_cause_accuracy
+        # 同一精确串比较口径,命名别名差异会同等影响两个指标);
+        # 无候选列表的样本不进分母,指标级 N/A 由 score_coverage 表达
+        topk_pairs = [
+            pair for pair in root_pairs if pair["predicted"].get("candidate_causes")
+        ]
+        top3_hits = [
+            pair["ground_truth"]["root_cause"]
+            in pair["predicted"]["candidate_causes"][:3]
+            for pair in topk_pairs
+        ]
+        top3_hit_rate = (
+            sum(1 for hit in top3_hits if hit) / len(top3_hits) if top3_hits else 0.0
         )
 
         # 置信度校准
@@ -669,6 +881,7 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
         return ReasoningMetrics(
             root_cause_accuracy=round(root_cause_acc, 4),
+            root_cause_top3_hit_rate=round(top3_hit_rate, 4),
             confidence_calibration_error=round(calibration_error, 4),
             confidence_calibration_score=round(calibration_score, 4),
             impact_chain_precision=round(precision, 4),
@@ -699,6 +912,16 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             # S4：真实产物的唯一 evidence 路径。
             "evidence": rca_event.get("evidence", {}),
             "reasoning_steps": output.get("reasoning_steps", []),
+            # Top-K 候选(P8 正式字段;旧产物回退贝叶斯 Top-5),归一为
+            # cause 名有序列表,供 root_cause_top3_hit_rate 使用
+            "candidate_causes": [
+                c.get("cause")
+                for c in (
+                    rca_event.get("candidate_causes")
+                    or rca_event.get("evidence", {}).get("bayesian_top_causes", [])
+                )
+                if isinstance(c, dict) and c.get("cause")
+            ],
         }
 
     def _get_reasoning_pairs(self, input_data: EvalInput) -> list[dict[str, Any]]:
@@ -1037,6 +1260,10 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             "reasoning": input_data.eval_type in (EvalType.REASONING, EvalType.FULL),
             "tool_call": input_data.eval_type in (EvalType.TOOL_CALL, EvalType.FULL),
             "rag": input_data.eval_type in (EvalType.RAG, EvalType.FULL),
+            # 测量维度:not_run/not_applicable 的分界只看"是否被请求";
+            # LLM 开关关闭/无可测事故属于数据不可得,归 not_applicable
+            "latency": input_data.eval_type in (EvalType.END_TO_END, EvalType.FULL),
+            "cost": input_data.eval_type in (EvalType.REASONING, EvalType.FULL),
         }
 
         def dimension(
@@ -1109,8 +1336,18 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
                 )
             )
         )
+        topk_count = sum(
+            1
+            for pair in pairs
+            if pair["ground_truth"].get("root_cause")
+            and pair["predicted"].get("candidate_causes")
+        )
         reasoning_metrics = {
             "root_cause_accuracy": (report.reasoning.root_cause_accuracy, root_count),
+            "root_cause_top3_hit_rate": (
+                report.reasoning.root_cause_top3_hit_rate,
+                topk_count,
+            ),
             "confidence_calibration_error": (
                 report.reasoning.confidence_calibration_error,
                 calibration_count,
@@ -1184,6 +1421,61 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         }
         rag_valid = max(rag_counts.values(), default=0)
 
+        # 测量维度覆盖:latency 逐指标独立分母;cost 计有 llm_meta 的来源数。
+        # 二者即便 evaluated 也不进 overall_score(_calculate_overall_score
+        # 只遍历 metric_specs 的四个质量维度)。
+        latency_samples = (
+            input_data.samples_by_type.get("latency") or []
+            if requested["latency"]
+            else []
+        )
+        e2e_latency_count = sum(
+            1 for s in latency_samples if s.get("end_to_end_seconds") is not None
+        )
+        latency_metrics = {
+            "end_to_end_seconds_mean": (
+                report.latency.end_to_end_seconds_mean,
+                e2e_latency_count,
+            ),
+            "ack_seconds_mean": (
+                report.latency.ack_seconds_mean,
+                sum(1 for s in latency_samples if s.get("stages", {}).get("ack") is not None),
+            ),
+            "rca_seconds_mean": (
+                report.latency.rca_seconds_mean,
+                sum(1 for s in latency_samples if s.get("stages", {}).get("rca") is not None),
+            ),
+            "heal_to_terminal_seconds_mean": (
+                report.latency.heal_to_terminal_seconds_mean,
+                sum(
+                    1
+                    for s in latency_samples
+                    if s.get("stages", {}).get("heal_to_terminal") is not None
+                ),
+            ),
+        }
+
+        cost_sources = 0
+        if requested["cost"]:
+            cost_sources = sum(
+                1
+                for result in input_data.agent_results
+                if result.get("agent_name") == "rca_agent"
+                and isinstance(
+                    result.get("output_data", {})
+                    .get("rca_event", {})
+                    .get("evidence", {})
+                    .get("llm_meta"),
+                    dict,
+                )
+            )
+            if report.reasoning.judge and report.reasoning.judge.get("llm_meta"):
+                cost_sources += 1
+        cost_metrics = {
+            "total_tokens": (float(report.cost.total_tokens), cost_sources),
+            "avg_llm_latency_ms": (report.cost.avg_llm_latency_ms, cost_sources),
+        }
+
         return {
             "end_to_end": dimension("end_to_end", e2e_metrics, e2e_total),
             "reasoning": dimension(
@@ -1194,6 +1486,8 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             ),
             "tool_call": dimension("tool_call", tool_metrics, tool_count),
             "rag": dimension("rag", rag_metrics, rag_valid),
+            "latency": dimension("latency", latency_metrics, len(latency_samples)),
+            "cost": dimension("cost", cost_metrics, cost_sources),
         }
 
     def _calculate_overall_score(self, report: EvalReport) -> float:
@@ -1412,9 +1706,12 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             )
 
         if not recommendations:
+            # 只看四个质量维度:latency/cost 是测量维度,只有它们 evaluated
+            # 时不能说 "all metrics within acceptable ranges"
+            quality_dimensions = ("end_to_end", "reasoning", "tool_call", "rag")
             has_evaluated_dimension = any(
-                coverage.get("status") == "evaluated"
-                for coverage in report.score_coverage.values()
+                report.score_coverage.get(name, {}).get("status") == "evaluated"
+                for name in quality_dimensions
             )
             if report.score_coverage and not has_evaluated_dimension:
                 recommendations.append(

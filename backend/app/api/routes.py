@@ -1509,6 +1509,8 @@ async def run_evaluation(
     # e2e 用例同样从真实 incident 产物重建(终态 + 有真值才参评),
     # 不再用 _get_default_test_cases 的预烤 fixture 自评
     e2e_test_cases: list[dict[str, Any]] = []
+    # 延迟样本:所有非种子、时间线完整的事故都可测(不要求有 rca_event)
+    latency_samples: list[dict[str, Any]] = []
     e2e_terminal_states = (
         IncidentState.RESOLVED,
         IncidentState.CLOSED,
@@ -1522,6 +1524,9 @@ async def run_evaluation(
         "total": 0,
     }
     for stored_incident_id, inc in _incident_service._incidents.items():
+        latency_sample = EvalAgent._timeline_to_latency_sample(inc)
+        if latency_sample is not None:
+            latency_samples.append(latency_sample)
         if inc.rca_event is not None:
             incident_id = str(getattr(inc, "incident_id", stored_incident_id))
             rca_event = inc.rca_event
@@ -1593,7 +1598,10 @@ async def run_evaluation(
         target_agent=agent_type or "",
         test_cases=e2e_test_cases,
         agent_results=agent_results,
-        samples_by_type={"reasoning": reasoning_samples},
+        samples_by_type={
+            "reasoning": reasoning_samples,
+            "latency": latency_samples,
+        },
     )
 
     # 函数内构造(白名单不允许模块级单例);process() 每次读 enable_judge 开关
