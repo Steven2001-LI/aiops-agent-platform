@@ -6,6 +6,7 @@ AIOps Agent Platform - LangGraph Orchestrator
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any, TypedDict
 
@@ -57,11 +58,26 @@ class Orchestrator:
     审批 pending 则作为合法的暂停终态保留。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_incident_update: Callable[[Incident], Awaitable[None]] | None = None,
+    ) -> None:
         self._state = OrchestratorState.IDLE
         self._current_incident: Incident | None = None
         self._graph: Any = None
         self._compiled_graph: Any = None
+        # 状态更新回调(HTTP 接线时注入 WebSocket 广播);None 时静默跳过,
+        # orchestrator 自身不依赖任何 HTTP/WS 模块
+        self._on_incident_update = on_incident_update
+
+    async def _notify(self, incident: Incident) -> None:
+        """通知调用方 incident 状态更新;回调失败不影响图执行。"""
+        if self._on_incident_update is None:
+            return
+        try:
+            await self._on_incident_update(incident)
+        except Exception as exc:
+            logger.debug("Incident update callback failed", error=str(exc))
 
     @property
     def state(self) -> OrchestratorState:
@@ -128,15 +144,25 @@ class Orchestrator:
             logger.warning("LangGraph not available; orchestrator cannot execute")
             return None
 
-    async def process_alert(self, alert: AlertEvent) -> Incident:
-        """通过已编译的 LangGraph 处理告警。"""
+    async def process_alert(
+        self,
+        alert: AlertEvent,
+        incident: Incident | None = None,
+    ) -> Incident:
+        """通过已编译的 LangGraph 处理告警。
+
+        Args:
+            alert: 告警事件
+            incident: 复用已注册的 Incident(HTTP 接线时传入,保证图内处理的
+                对象与故障存储/前端查询到的是同一个);None 时自行创建
+        """
         logger.info(
             "Orchestrator processing alert",
             service=alert.service,
             severity=alert.severity.value,
         )
         self._state = OrchestratorState.RECEIVING_ALERT
-        incident = Incident.from_alert(alert)
+        incident = incident or Incident.from_alert(alert)
         self._current_incident = incident
 
         if self._compiled_graph is None:
@@ -210,11 +236,13 @@ class Orchestrator:
     # === LangGraph 节点 ===
 
     async def _node_receive_alert(self, state: GraphState) -> dict[str, Any]:
-        """接收告警并确认 incident。"""
+        """接收告警并确认 incident(对已 ACK 的注入 incident 幂等)。"""
         self._state = OrchestratorState.RECEIVING_ALERT
         logger.info("Graph node: receive_alert")
         incident = state["incident"]
-        incident.transition_to(IncidentState.ACKNOWLEDGED, actor="orchestrator")
+        if incident.state != IncidentState.ACKNOWLEDGED:
+            incident.transition_to(IncidentState.ACKNOWLEDGED, actor="orchestrator")
+        await self._notify(incident)
         return {"incident": incident, "current_phase": "triage"}
 
     async def _node_triage(self, state: GraphState) -> dict[str, Any]:
@@ -267,6 +295,7 @@ class Orchestrator:
             incident.context["rca_root_cause"] = result.output_data.get("root_cause", "unknown")
             incident.context["rca_confidence"] = result.output_data.get("confidence", 0)
             incident.transition_to(IncidentState.RCA_COMPLETED, actor="rca_agent")
+            await self._notify(incident)
             return {
                 "incident": incident,
                 "current_phase": "decision",
@@ -343,6 +372,7 @@ class Orchestrator:
             incident.heal_events.append(heal_event)
             incident.context["heal_action"] = result.output_data.get("action", heal_event.action)
             incident.context["heal_level"] = result.output_data.get("heal_level", heal_event.level)
+            await self._notify(incident)
             return {
                 "incident": incident,
                 "current_phase": "approval",
@@ -422,6 +452,7 @@ class Orchestrator:
                     agent_results=results,
                     approval_status=approval_status,
                 )
+            await self._notify(incident)
             return {
                 "incident": incident,
                 "current_phase": (
@@ -469,6 +500,7 @@ class Orchestrator:
             }
         if incident.state != IncidentState.ESCALATED:
             incident.transition_to(IncidentState.ESCALATED, actor="orchestrator")
+        await self._notify(incident)
         return {
             "incident": incident,
             "current_phase": "escalated",
@@ -484,6 +516,7 @@ class Orchestrator:
         incident.context["resolution_mode"] = "simulated"
         if incident.state != IncidentState.RESOLVED:
             incident.transition_to(IncidentState.RESOLVED, actor="orchestrator")
+        await self._notify(incident)
         return {
             "incident": incident,
             "current_phase": "completed",

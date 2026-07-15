@@ -170,6 +170,13 @@ class AppConfig(BaseSettings):
     log_level: str = Field(default="INFO", description="日志级别")
     debug: bool = Field(default=False, description="调试模式")
 
+    # 故障处理管道引擎(APP_PIPELINE_ENGINE):
+    # legacy = routes.py 顺序流水线(默认);langgraph = LangGraph 状态机编排器,
+    # 依赖缺失时运行期自动回落 legacy。
+    pipeline_engine: Literal["legacy", "langgraph"] = Field(
+        default="legacy", description="故障处理管道引擎"
+    )
+
     # CORS 配置
     cors_origins: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:5173"],

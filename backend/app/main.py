@@ -268,9 +268,10 @@ def create_app() -> FastAPI:
             "status": "ready" if kb is not None else "degraded",
         }
 
-        # 5. LangGraph
+        # 5. LangGraph(status 反映图可用性;engine 反映配置的执行引擎)
         checks["langgraph"] = {
             "status": "ready" if getattr(app.state, "langgraph_available", False) else "fallback_sequential",
+            "engine": get_config().pipeline_engine,
         }
 
         status_code = 200 if all_critical_ok else 503

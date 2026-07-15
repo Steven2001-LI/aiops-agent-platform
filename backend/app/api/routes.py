@@ -415,8 +415,8 @@ async def trigger_incident(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
-    # 启动后台处理（不阻塞响应）
-    asyncio.create_task(_process_incident_pipeline(incident))
+    # 启动后台处理（不阻塞响应;引擎由 APP_PIPELINE_ENGINE 决定）
+    _dispatch_pipeline(incident, config)
 
     return {
         "incident_id": incident.incident_id,
@@ -568,6 +568,60 @@ async def trigger_business_scenario(
         "expected_root_cause": scenario["root_cause"],
         "result": result.output_data,
     }
+
+
+def _dispatch_pipeline(incident: Incident, config: AppConfig | None = None) -> None:
+    """按 APP_PIPELINE_ENGINE 调度后台处理任务(langgraph | legacy)。"""
+    cfg = config or get_config()
+    if cfg.pipeline_engine == "langgraph":
+        asyncio.create_task(_run_langgraph_pipeline(incident))
+    else:
+        asyncio.create_task(_process_incident_pipeline(incident))
+
+
+async def _run_langgraph_pipeline(incident: Incident) -> None:
+    """LangGraph 引擎执行路径。
+
+    - 每次请求新建 Orchestrator:其 _state/_current_incident 是实例态,
+      复用 app.state 单例在并发触发下会互相覆盖
+    - 传入已注册的 incident,保证图内处理对象与故障存储中是同一个
+    - 注入 _broadcast_incident 作状态更新回调,前端实时推送与 legacy 一致
+    - LangGraph 依赖缺失(build_graph 返回 None)时回落 legacy 管道,
+      避免配置错误导致所有告警被直接升级
+    """
+    from app.agents.orchestrator import Orchestrator
+
+    orchestrator = Orchestrator(on_incident_update=_broadcast_incident)
+    if orchestrator.build_graph() is None:
+        logger.warning(
+            "LangGraph unavailable, falling back to legacy pipeline",
+            incident_id=incident.incident_id,
+        )
+        await _process_incident_pipeline(incident)
+        return
+
+    try:
+        await orchestrator.process_alert(incident.alert_event, incident=incident)
+    except Exception as e:
+        logger.error(
+            "LangGraph pipeline error",
+            incident_id=incident.incident_id,
+            error=str(e),
+        )
+        await _escalate_pipeline_failure(
+            incident,
+            stage="pipeline",
+            error_message=str(e),
+            actor="orchestrator",
+        )
+        return
+
+    await _incident_service.save(incident)
+    logger.info(
+        "LangGraph pipeline finished",
+        incident_id=incident.incident_id,
+        state=incident.state.value,
+    )
 
 
 async def _process_incident_pipeline(incident: Incident) -> None:
@@ -1902,8 +1956,8 @@ async def diagnose_from_natural_language(
             incident.transition_to(IncidentState.ACKNOWLEDGED, actor="nl-diagnosis")
             await _incident_service.save(incident)
 
-            # 异步触发管道
-            asyncio.create_task(_process_incident_pipeline(incident))
+            # 异步触发管道(引擎由 APP_PIPELINE_ENGINE 决定)
+            _dispatch_pipeline(incident)
 
             triggered_incident = {
                 "incident_id": incident.incident_id,

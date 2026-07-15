@@ -14,12 +14,14 @@
 | 输出是什么 | 故障状态机全程流转记录（WebSocket 实时推送）：根因假设与置信度、Dry-Run 恢复计划、风险评分与审批结论、归档到记忆系统的诊断经验 |
 | 边界在哪 | 受控模拟原型：不触碰真实基础设施、不执行真实修复；LLM 是可选增强，默认走纯规则路径 |
 
-## 两条真实执行路径
+## 一个开关、两种执行引擎
 
-代码中存在两条独立的编排路径，请勿混淆：
+`POST /api/v1/incidents/trigger` 的后台处理引擎由环境变量 `APP_PIPELINE_ENGINE` 决定（`/ready` 的 `checks.langgraph.engine` 会如实报告当前配置）：
 
-1. **HTTP Demo Pipeline（当前 API 的实际执行器）**：`POST /api/v1/incidents/trigger` 触发的是 [`routes.py`](backend/app/api/routes.py) 中手写的顺序管道 `_process_incident_pipeline`——Monitor → RCA → Heal(Dry-Run) → Change 依次执行，任一阶段失败转人工升级（ESCALATED），审批 `pending` 则暂停流程（当前没有完整的审批恢复执行 API）。
-2. **独立 LangGraph 状态机（演示路径）**：[`orchestrator.py`](backend/app/agents/orchestrator.py) 用 LangGraph 构建了同语义的条件路由状态机（含人工升级、pending 暂停终态、模拟解决），应用启动时会真实构建，可通过 `Orchestrator.process_alert()` 执行，有独立测试覆盖——但它**不是**当前 HTTP 请求的执行器。
+1. **`legacy`（默认）— 手写顺序管道**：[`routes.py`](backend/app/api/routes.py) 的 `_process_incident_pipeline`——Monitor → RCA → Heal(Dry-Run) → Change 依次执行，任一阶段失败转人工升级（ESCALATED），审批 `pending` 暂停后可经 `POST /api/v1/incidents/{id}/approve|reject` 人工恢复。
+2. **`langgraph` — LangGraph 状态机**：[`orchestrator.py`](backend/app/agents/orchestrator.py) 的条件路由状态机（含人工升级、pending 暂停终态、模拟解决），经 `Orchestrator.process_alert()` 承接同一个已注册的 Incident，WebSocket 状态推送通过回调注入。LangGraph 依赖缺失时运行期自动回落 legacy。
+
+两种引擎的已知差异（如实声明）：langgraph 引擎不含 Monitor 异常确认阶段（receive_alert → triage 直接进 RCA），不写入记忆系统，事件字段挂载与终态语义（RESOLVED / AWAITING_APPROVAL / ESCALATED）与 legacy 一致，另会在 `context` 里附加 `orchestrator.*` 的各节点产物。
 
 Candidate Evaluation 不会在 Incident Pipeline 结束后自动运行；需要通过独立的 `POST /api/v1/evaluations/run` 端点手动触发。
 
@@ -141,11 +143,11 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 
 ## 能力边界（如实声明）
 
-1. HTTP API 当前执行的是手写顺序管道；LangGraph 状态机是真实存在的独立演示路径，不承接 HTTP 请求。
+1. HTTP API 默认执行手写顺序管道；LangGraph 状态机经 `APP_PIPELINE_ENGINE=langgraph` 可承接 HTTP 请求，但不含 Monitor 阶段、不写记忆系统（见上文两引擎差异）。
 2. Heal Agent 只生成 Playbook 匹配结果、Dry-Run 模拟与风险评估，不对任何真实基础设施执行修复。
-3. 审批 `pending` 会暂停流程，但当前没有完整的"审批通过后恢复执行"API。
+3. 审批 `pending` 暂停后可经 `POST /api/v1/incidents/{id}/approve|reject` 人工恢复（approve 补跑模拟收尾，reject 转人工升级）。
 4. Chroma 使用本地 `PersistentClient` 持久化，主代码未接入独立 Chroma 服务容器。
-5. 服务拓扑、指标数据、故障场景均来自内置模拟数据集（[`backend/app/data/`](backend/app/data/)）。
+5. 服务拓扑、指标数据、故障场景、业务事件均来自内置模拟数据集（[`backend/app/data/`](backend/app/data/)）。
 6. 本项目不声称生产可用，不声称降低真实 MTTR，不声称实现线上自动自愈。
 
 ## Demo / Synthetic Data 声明
@@ -201,7 +203,7 @@ aiops-agent-platform/
 ## 技术栈
 
 - **后端**：Python 3.11 · FastAPI · Uvicorn · Pydantic v2 · structlog
-- **Agent 编排**：手写顺序管道（HTTP 主路径）· LangGraph（独立状态机演示）
+- **Agent 编排**：手写顺序管道（默认引擎）· LangGraph 状态机（`APP_PIPELINE_ENGINE=langgraph` 切换）
 - **算法**：NumPy · scikit-learn（Isolation Forest）· 贝叶斯推理 · BFS 拓扑遍历
 - **LLM（可选）**：OpenAI 兼容 SDK（OpenAI / DeepSeek），结构化输出 + 规则降级
 - **存储**：ChromaDB（本地 PersistentClient）· SQLite
