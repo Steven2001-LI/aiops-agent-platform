@@ -6,6 +6,8 @@ AIOps Agent Platform - Incident Service
 
 from __future__ import annotations
 
+import os
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,11 +28,99 @@ class IncidentService:
     故障服务
 
     提供故障的创建、查询、更新和状态管理。
+
+    存储模型:内存 dict 是读路径的主副本(过滤/分页均在内存完成),
+    SQLite(与 eval_tools 共用 SQLITE_PATH 指向的库,单表 JSON 文档列)
+    作为落盘副本 — 写入即持久、启动时经 load_all() 恢复,重启不再丢数据。
     """
 
-    def __init__(self) -> None:
-        # TODO: 使用真实数据库
+    def __init__(self, db_path: str | None = None) -> None:
         self._incidents: dict[str, Incident] = {}
+        self._db_path_override = db_path
+
+    @property
+    def _db_path(self) -> str:
+        """每次访问时解析,与 eval_tools 一致地尊重运行期 SQLITE_PATH 变化。"""
+        return self._db_path_override or os.getenv("SQLITE_PATH", "./data/aiops.db")
+
+    # ---- 持久化 ----
+
+    def _connect(self) -> sqlite3.Connection:
+        directory = os.path.dirname(self._db_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        conn = sqlite3.connect(self._db_path, timeout=5)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS incidents ("
+            "incident_id TEXT PRIMARY KEY, "
+            "data TEXT NOT NULL, "
+            "state TEXT, "
+            "updated_at TEXT)"
+        )
+        return conn
+
+    def _persist(self, incident: Incident) -> None:
+        """best-effort 落盘:失败只记告警,内存副本仍是可用数据源。"""
+        try:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO incidents "
+                    "(incident_id, data, state, updated_at) VALUES (?, ?, ?, ?)",
+                    (
+                        incident.incident_id,
+                        incident.model_dump_json(),
+                        incident.state.value,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(
+                "Failed to persist incident",
+                incident_id=incident.incident_id,
+                error=str(e),
+            )
+
+    async def save(self, incident: Incident) -> None:
+        """写入内存主副本并落盘。
+
+        管道对已注册的 Incident 对象做就地变异,因此每个状态推进点
+        (创建/挂起/收尾/升级/人工审批)都应调用一次 save 刷新落盘快照。
+        """
+        self._incidents[incident.incident_id] = incident
+        self._persist(incident)
+
+    async def load_all(self) -> int:
+        """启动时从 SQLite 恢复历史故障到内存;损坏行跳过不阻塞启动。"""
+        try:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT incident_id, data FROM incidents"
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("Failed to load persisted incidents", error=str(e))
+            return 0
+
+        loaded = 0
+        for incident_id, data in rows:
+            try:
+                self._incidents[incident_id] = Incident.model_validate_json(data)
+                loaded += 1
+            except Exception as e:
+                logger.warning(
+                    "Skipping corrupt persisted incident",
+                    incident_id=incident_id,
+                    error=str(e),
+                )
+        if loaded:
+            logger.info("Persisted incidents restored", count=loaded)
+        return loaded
 
     async def create_from_alert(self, alert: AlertEvent) -> Incident:
         """
@@ -44,6 +134,7 @@ class IncidentService:
         """
         incident = Incident.from_alert(alert)
         self._incidents[incident.incident_id] = incident
+        self._persist(incident)
 
         logger.info(
             "Incident created",
@@ -88,6 +179,7 @@ class IncidentService:
             return None
 
         incident.transition_to(new_state, actor)
+        self._persist(incident)
 
         logger.info(
             "Incident state updated",
@@ -118,6 +210,7 @@ class IncidentService:
             return False
 
         incident.add_agent_execution(record)
+        self._persist(incident)
         return True
 
     async def list(
@@ -190,6 +283,7 @@ class IncidentService:
             return False
 
         incident.metrics = metrics
+        self._persist(incident)
         return True
 
 

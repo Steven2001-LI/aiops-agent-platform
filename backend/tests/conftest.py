@@ -27,6 +27,15 @@ import os
 os.environ["LANGFUSE_ENABLED"] = "false"
 
 
+# 测试隔离:SQLITE_PATH 逐用例指向独立临时库。
+# IncidentService 持久化与 eval_tools 都按调用时的 SQLITE_PATH 落盘,
+# 若不隔离,测试会写脏开发库 ./data/aiops.db,且 lifespan 测试的 load_all()
+# 会把前序用例持久化的故障加载回共享单例,造成跨用例状态泄漏。
+@pytest.fixture(autouse=True)
+def _isolated_sqlite_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "aiops-test.db"))
+
+
 # =============================================================================
 # Event Loop Policy
 # =============================================================================

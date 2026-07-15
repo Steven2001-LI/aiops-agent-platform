@@ -21,6 +21,7 @@ from app.api.webhooks import webhook_router
 from app.api.websocket import websocket_router
 from app.config import get_config
 from app.infrastructure import InfrastructureRegistry
+from app.services.incident_service import get_incident_service
 from app.services.langfuse_service import get_langfuse_service
 from app.utils.logging import configure_logging, get_logger
 
@@ -48,6 +49,10 @@ async def lifespan(app: FastAPI):
     infra_status = await infra.initialize()
     app.state.infrastructure = infra
     app.state.startup_status = infra_status
+
+    # 恢复持久化的历史故障(SQLite → 内存主副本;失败不阻塞启动)
+    restored = await get_incident_service().load_all()
+    logger.info("Incident store ready", restored=restored)
 
     # 知识库加载（KnowledgeBase 是静态工具类，直接读取模块级常量）
     try:

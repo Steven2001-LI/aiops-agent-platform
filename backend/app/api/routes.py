@@ -365,6 +365,7 @@ def _seed_incidents() -> None:
         incident.created_at = now - _td(minutes=(len(seeds) - i) * 15)
         incident.updated_at = now
         _incident_service._incidents[incident.incident_id] = incident
+        _incident_service._persist(incident)
 
     logger.info("Seed incidents created", count=len(seeds))
 
@@ -405,7 +406,7 @@ async def trigger_incident(
     # 创建故障实例
     incident = Incident.from_alert(alert)
     incident.transition_to(IncidentState.ACKNOWLEDGED, actor="orchestrator")
-    _incident_service._incidents[incident.incident_id] = incident
+    await _incident_service.save(incident)
 
     # WebSocket 广播: 故障已创建
     await ws_manager.broadcast({
@@ -865,6 +866,7 @@ async def _process_incident_pipeline(incident: Incident) -> None:
         approval_status = change_result.output_data.get("approval_status", "")
         if approval_status == "pending":
             await _broadcast_incident(incident)
+            await _incident_service.save(incident)
             logger.info(
                 "Incident pipeline paused for approval",
                 incident_id=incident.incident_id,
@@ -885,6 +887,7 @@ async def _process_incident_pipeline(incident: Incident) -> None:
         incident.context["resolution_mode"] = "simulated"
         incident.transition_to(IncidentState.RESOLVED, actor="orchestrator")
         await _broadcast_incident(incident)
+        await _incident_service.save(incident)
         logger.info("Incident pipeline completed", incident_id=incident.incident_id)
 
         # → 归档：将本次故障的工作记忆转为长期记忆
@@ -937,6 +940,7 @@ async def _escalate_pipeline_failure(
             "error": error_message,
         })
     await _broadcast_incident(incident)
+    await _incident_service.save(incident)
 
 
 def _get_metric(incident: Incident) -> str:
@@ -1148,6 +1152,7 @@ async def approve_incident(
     except Exception as e:
         logger.debug("Failed to archive working memory (non-fatal)", error=str(e))
 
+    await _incident_service.save(incident)
     logger.info(
         "Incident change approved by human",
         incident_id=incident.incident_id,
@@ -1895,7 +1900,7 @@ async def diagnose_from_natural_language(
 
             incident = Incident.from_alert(alert)
             incident.transition_to(IncidentState.ACKNOWLEDGED, actor="nl-diagnosis")
-            _incident_service._incidents[incident.incident_id] = incident
+            await _incident_service.save(incident)
 
             # 异步触发管道
             asyncio.create_task(_process_incident_pipeline(incident))

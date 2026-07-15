@@ -289,6 +289,7 @@ async def _run_agent_pipeline(incident: Incident) -> None:
 
         if approval_status == "pending":
             await _broadcast_incident_state(incident)
+            await _incident_service.save(incident)
             logger.info(
                 "Webhook pipeline paused for approval",
                 incident_id=incident.incident_id,
@@ -313,6 +314,7 @@ async def _run_agent_pipeline(incident: Incident) -> None:
         except Exception as e:
             logger.debug("Failed to archive webhook working memory", error=str(e))
         await _broadcast_incident_state(incident)
+        await _incident_service.save(incident)
 
     except Exception as e:
         logger.error("Webhook pipeline error", incident_id=incident.incident_id, error=str(e))
@@ -367,6 +369,7 @@ async def _escalate_pipeline_failure(
             "error": error_message,
         })
     await _broadcast_incident_state(incident)
+    await _incident_service.save(incident)
 
 
 # =============================================================================
@@ -477,7 +480,7 @@ async def alertmanager_webhook(request: Request) -> dict[str, Any]:
                 # 创建 Incident 并触发 Agent 管道
                 incident = Incident.from_alert(alert_event)
                 incident.transition_to(IncidentState.ACKNOWLEDGED, actor="alertmanager-webhook")
-                _incident_service._incidents[incident.incident_id] = incident
+                await _incident_service.save(incident)
 
                 # 异步后台处理（不阻塞 webhook 响应）
                 asyncio.create_task(_run_agent_pipeline(incident))
