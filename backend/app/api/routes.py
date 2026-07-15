@@ -58,6 +58,10 @@ api_router = APIRouter(prefix="/api/v1")
 
 # 全局服务实例（模块级别单例）
 _incident_service = get_incident_service()
+
+# 评测运行历史:POST /evaluations/run 成功后按维度落一条记录,
+# GET /evaluations 从这里读真实历史(进程内存储,重启即清空)
+_evaluation_runs: list[dict[str, Any]] = []
 _monitor_agent: MonitorAgent | None = None
 _rca_agent: RCAAgent | None = None
 _heal_agent: HealAgent | None = None
@@ -1196,64 +1200,20 @@ async def list_evaluations(
     eval_type: EvaluationType | None = Query(None, description="按评估类型过滤"),
     agent_type: str | None = Query(None, description="按 Agent 类型过滤"),
 ) -> dict[str, Any]:
-    """查询评估结果列表"""
+    """查询评估结果列表（真实运行历史,最新在前;未跑过评测时为空列表）"""
     logger.info("List evaluations requested")
 
-    items = [
-        {
-            "id": "EVAL-001",
-            "dimension": "end_to_end",
-            "overall_score": 87.5,
-            "eval_type": "end_to_end",
-            "metrics": [
-                {"name": "任务成功率", "score": 92, "weight": 0.4},
-                {"name": "MTTR", "score": 85, "weight": 0.3},
-                {"name": "自动化率", "score": 82, "weight": 0.3},
-            ],
-            "timestamp": "2026-06-27T08:00:00Z",
-        },
-        {
-            "id": "EVAL-002",
-            "dimension": "reasoning",
-            "overall_score": 91.2,
-            "eval_type": "reasoning",
-            "metrics": [
-                {"name": "根因准确率", "score": 94, "weight": 0.5},
-                {"name": "置信度校准", "score": 88, "weight": 0.5},
-            ],
-            "timestamp": "2026-06-26T16:00:00Z",
-        },
-        {
-            "id": "EVAL-003",
-            "dimension": "tool_calling",
-            "overall_score": 78.9,
-            "eval_type": "tool_calling",
-            "metrics": [
-                {"name": "工具选择准确率", "score": 82, "weight": 0.5},
-                {"name": "参数正确率", "score": 76, "weight": 0.5},
-            ],
-            "timestamp": "2026-06-26T10:00:00Z",
-        },
-        {
-            "id": "EVAL-004",
-            "dimension": "rag",
-            "overall_score": 85.0,
-            "eval_type": "rag",
-            "metrics": [
-                {"name": "检索精确率", "score": 88, "weight": 0.5},
-                {"name": "回答质量", "score": 82, "weight": 0.5},
-            ],
-            "timestamp": "2026-06-25T14:00:00Z",
-        },
-    ]
-
-    filtered = items
+    filtered = list(reversed(_evaluation_runs))
     if eval_type:
         filtered = [i for i in filtered if i.get("eval_type") == eval_type.value]
 
+    total = len(filtered)
+    start = (params.page - 1) * params.page_size
+    page_items = filtered[start : start + params.page_size]
+
     return {
-        "items": filtered,
-        "total": len(filtered),
+        "items": page_items,
+        "total": total,
         "page": params.page,
         "page_size": params.page_size,
         "filters": {
@@ -1261,6 +1221,43 @@ async def list_evaluations(
             "agent_type": agent_type,
         },
     }
+
+
+def _record_evaluation_run(eval_id: str, report: dict[str, Any]) -> None:
+    """把一次成功的评测运行按维度落入 _evaluation_runs。
+
+    分值口径:评测框架输出 0~1,对外展示统一为 0~100;
+    维度名口径:后端枚举 tool_call 对外映射为 tool_calling(前端 dimensionMeta 键)。
+    """
+    generated_at = report.get("generated_at")
+    if isinstance(generated_at, datetime):
+        timestamp = generated_at.isoformat()
+    elif generated_at:
+        timestamp = str(generated_at)
+    else:
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+    for r in report.get("eval_results", []):
+        dimension = str(r.get("eval_type", ""))
+        _evaluation_runs.append(
+            {
+                "id": f"{eval_id}-{dimension}",
+                "run_id": eval_id,
+                "dimension": "tool_calling" if dimension == "tool_call" else dimension,
+                "eval_type": dimension,
+                "status": r.get("status", ""),
+                "overall_score": round(float(r.get("overall_score", 0.0)) * 100, 1),
+                "metrics": [
+                    {
+                        "name": m.get("name", ""),
+                        "score": round(float(m.get("score", 0.0)) * 100, 1),
+                        "weight": m.get("weight", 0.0),
+                    }
+                    for m in r.get("metrics", [])
+                ],
+                "timestamp": timestamp,
+            }
+        )
 
 
 @api_router.post(
@@ -1409,6 +1406,8 @@ async def run_evaluation(
         response["execution"] = "completed"
         response["report"] = result.output_data.get("report")
         response["overall_score"] = result.output_data.get("overall_score")
+        # 成功运行落入历史,GET /evaluations 由此返回真实数据
+        _record_evaluation_run(eval_id, result.output_data.get("report") or {})
     return response
 
 
