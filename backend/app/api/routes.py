@@ -30,14 +30,11 @@ from app.data.datasets import (
     get_metric_data,
 )
 from app.data.knowledge_base import (
-    KNOWLEDGE_BASE,
     SERVICE_TOPOLOGY,
-    KnowledgeBase,
 )
-from app.data.playbooks import PLAYBOOKS
 from app.dependencies import CommonQueryParams
-from app.models.agent import AgentState, AgentStatus, AgentType
-from app.models.evaluation import EvaluationResult, EvaluationType
+from app.models.agent import AgentStatus, AgentType
+from app.models.evaluation import EvaluationType
 from app.models.events import (
     AlertEvent,
     ApprovalStatus,
@@ -431,15 +428,15 @@ async def trigger_incident(
     "/incidents/seed-demo",
     response_model=dict[str, Any],
     tags=["Incidents"],
-    summary="注入演示故障数据（仅 dev 环境）",
+    summary="注入演示故障数据（需 APP_ENABLE_DEMO_SEED=true）",
 )
 async def seed_demo_incidents() -> dict[str, Any]:
-    """显式注入 7 个演示 incident。仅在 APP_ENV=development 时可用。"""
+    """显式注入 7 个演示 incident。默认关闭,APP_ENABLE_DEMO_SEED=true 时可用。"""
     config = get_config()
-    if config.env != "development":
+    if not config.enable_demo_seed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="seed-demo endpoint is only available in development environment",
+            detail="seed-demo endpoint is disabled; set APP_ENABLE_DEMO_SEED=true to enable",
         )
     _seed_incidents()
     return {
@@ -1447,33 +1444,38 @@ def _record_evaluation_run(eval_id: str, report: dict[str, Any]) -> None:
 @api_router.post(
     "/evaluations/run",
     response_model=dict[str, Any],
-    status_code=status.HTTP_202_ACCEPTED,
     tags=["Evaluations"],
     summary="执行评估",
-    description="触发指定类型的评估任务。",
+    description="同步执行指定类型的评估，eval_type 可放在 query 或 JSON body。",
 )
 async def run_evaluation(
-    eval_type: EvaluationType,
+    eval_type: EvaluationType | None = Query(None),
     agent_type: str | None = None,
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """执行评估
+    """同步执行评估，成功时直接返回 completed 报告。"""
+    selected_eval_type = eval_type
+    if selected_eval_type is None:
+        raw_eval_type = (body or {}).get("eval_type")
+        try:
+            selected_eval_type = EvaluationType(raw_eval_type)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="eval_type is required in query or JSON body",
+            )
 
-    D6 接真:构造 EvalInput(默认测试集 + 从 _incident_service 现有故障重建的 RCA
-    产物,即真实冒烟"先 trigger 后 run"的数据面)→ 调 EvalAgent。响应保留既有 4 个
-    key(兼容任何依赖方,status 字面量恒为 "started"),评测产出增量附加;空库或
-    reasoning 缺数据导致 process 降级为 failure 时,增量键优雅缺席、端点仍返回 202。
-    judge 开关由 EvalAgent.process() 每次读全局配置(未注入路径)。
-    """
     logger.info(
-        "Run evaluation requested", eval_type=eval_type.value, agent_type=agent_type
+        "Run evaluation requested",
+        eval_type=selected_eval_type.value,
+        agent_type=agent_type,
     )
 
     eval_id = f"eval-run-{uuid.uuid4().hex[:8]}"
 
     # EvaluationType → EvalType(safety/performance 无对应维度 → 落 FULL)
     try:
-        mapped_type = EvalType(eval_type.value)
+        mapped_type = EvalType(selected_eval_type.value)
     except ValueError:
         mapped_type = EvalType.FULL
 
@@ -1577,21 +1579,29 @@ async def run_evaluation(
     )
     result = await eval_agent.execute(eval_input, ctx)
 
-    # 既有 4 key 原样保留(守住 test_api.py 绿基线)
+    if not result.success or not result.output_data:
+        error_message = result.error_message or "Evaluation failed without a report"
+        failure_status = (
+            status.HTTP_422_UNPROCESSABLE_ENTITY
+            if "Cannot evaluate" in error_message
+            else status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+        raise HTTPException(
+            status_code=failure_status,
+            detail=error_message,
+        )
+
     response: dict[str, Any] = {
         "eval_id": eval_id,
-        "status": "started",
-        "eval_type": eval_type.value,
-        "message": f"Evaluation task {eval_id} started — results will be available shortly",
+        "status": "completed",
+        "execution": "completed",
+        "eval_type": selected_eval_type.value,
+        "message": f"Evaluation {eval_id} completed",
         "ground_truth_sources": ground_truth_sources,
+        "report": result.output_data.get("report"),
+        "overall_score": result.output_data.get("overall_score"),
     }
-    # 增量:诚实反映实际执行结果(降级/空库时优雅缺席)
-    if result.success and result.output_data:
-        response["execution"] = "completed"
-        response["report"] = result.output_data.get("report")
-        response["overall_score"] = result.output_data.get("overall_score")
-        # 成功运行落入历史,GET /evaluations 由此返回真实数据
-        _record_evaluation_run(eval_id, result.output_data.get("report") or {})
+    _record_evaluation_run(eval_id, result.output_data.get("report") or {})
     return response
 
 
@@ -1751,10 +1761,11 @@ def _parse_memory_type(memory_type: str | None) -> MemoryType | None:
 
 def _memory_entry_to_dict(entry: Any) -> dict[str, Any]:
     """MemoryEntry → 端点响应结构(保留 key/value 等既有字段名兼容消费方)。"""
+    display_key = entry.metadata.get("display_key") if entry.metadata else None
     return {
         "id": entry.memory_id,
         "memory_id": entry.memory_id,
-        "key": entry.summary or entry.content[:50],
+        "key": display_key or entry.summary or entry.content[:50],
         "value": entry.content,
         "type": entry.memory_type.value,
         "created_at": entry.created_at.isoformat(),
@@ -1830,13 +1841,31 @@ async def search_memory(
     description="向记忆系统中存储新的记忆条目。",
 )
 async def store_memory(
-    content: str,
-    memory_type: str = "observation",
-    incident_id: str = "",
-    tags: list[str] | None = None,
+    content: str | None = Query(None),
+    memory_type: str | None = Query(None),
+    incident_id: str | None = Query(None),
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """存储记忆 — 真实写入 MemorySystem(此前只返回假 ID,不落任何存储)"""
-    mt = _parse_memory_type(memory_type) or MemoryType.OBSERVATION
+    """存储记忆 — 同时兼容历史 query 参数与前端 JSON body。"""
+    payload = body or {}
+    resolved_content = content or str(payload.get("content", ""))
+    if not resolved_content.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="content is required",
+        )
+
+    resolved_type = memory_type or str(payload.get("memory_type", "observation"))
+    resolved_incident_id = incident_id or str(payload.get("incident_id", ""))
+    raw_tags = payload.get("tags", [])
+    tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
+    try:
+        importance = float(payload.get("importance", 0.5))
+    except (TypeError, ValueError):
+        importance = 0.5
+    importance = min(1.0, max(0.0, importance))
+
+    mt = _parse_memory_type(resolved_type) or MemoryType.OBSERVATION
 
     ms = await _get_memory_system()
     if ms is None:
@@ -1847,11 +1876,13 @@ async def store_memory(
 
     try:
         entry = await ms.store(
-            content=content,
+            content=resolved_content,
             memory_type=mt,
             source_agent="api",
-            source_incident_id=incident_id,
-            tags=tags or [],
+            source_incident_id=resolved_incident_id,
+            importance=importance,
+            tags=tags,
+            metadata={"display_key": str(payload.get("key", ""))},
         )
     except Exception as e:
         logger.warning("Memory store failed", error=str(e))
@@ -1860,12 +1891,12 @@ async def store_memory(
             detail="Memory store failed",
         )
 
-    logger.info("Store memory", memory_type=memory_type, memory_id=entry.memory_id)
+    logger.info("Store memory", memory_type=resolved_type, memory_id=entry.memory_id)
     return {
         "memory_id": entry.memory_id,
         "status": "stored",
-        "content_length": len(content),
-        "type": memory_type,
+        "content_length": len(resolved_content),
+        "type": resolved_type,
     }
 
 

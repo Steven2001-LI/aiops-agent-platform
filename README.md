@@ -158,7 +158,7 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 - `/api/v1/agents` 与 `/api/v1/agents/{id}/status` 返回的执行次数、成功率为预设演示值。
 - `/api/v1/evaluations` 列表返回静态示例评估记录；`/api/v1/topology` 中节点 CPU/内存/延迟为模拟值。
 - 前端仪表盘的初始 incident 与统计数据为预置演示状态（[`frontend/src/store/useAppStore.ts`](frontend/src/store/useAppStore.ts)）。
-- 演示故障数据注入端点 `/api/v1/incidents/seed-demo` 仅在 development 环境开放。
+- 演示故障数据（7 条预置事故）由 `APP_ENABLE_DEMO_SEED` 开关控制，默认关闭：开启后启动时自动注入，`/api/v1/incidents/seed-demo` 端点亦可手动触发；关闭时端点返回 403。`docker-compose.dev.yml` 演示栈显式开启。
 
 ## Candidate Evaluation 说明
 

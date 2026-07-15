@@ -2300,6 +2300,7 @@ v1.0 文档虽然代码引用详细，但审计代码时发现 11 个断点导�
 - 删除 `routes.py:270` 的模块加载时 `_seed_incidents()` 调用。
 - 函数 `_seed_incidents()` 保留，可被显式调用。
 - 新增 `POST /api/v1/incidents/seed-demo` 端点，仅在 `APP_ENV=development` 时可用，其他环境返回 403。
+  （后续修复轮已把门槛改为专用开关 `APP_ENABLE_DEMO_SEED`，默认关闭，与 `APP_ENV` 解耦；开启时启动即自动预置。）
 
 #### Phase 2 — Orchestrator 补完
 

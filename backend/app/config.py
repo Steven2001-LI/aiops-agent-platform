@@ -204,6 +204,13 @@ class AppConfig(BaseSettings):
         default="legacy", description="故障处理管道引擎"
     )
 
+    # 演示故障种子开关(APP_ENABLE_DEMO_SEED):
+    # 默认关闭 — 新克隆/生产启动无任何预置数据;打开后启动时自动注入
+    # 7 条演示事故,seed-demo 端点也随之可用(仅演示场景使用)。
+    enable_demo_seed: bool = Field(
+        default=False, description="演示故障种子(默认关)"
+    )
+
     # CORS 配置
     cors_origins: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:5173"],

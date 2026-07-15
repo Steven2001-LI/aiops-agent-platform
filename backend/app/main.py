@@ -54,6 +54,13 @@ async def lifespan(app: FastAPI):
     restored = await get_incident_service().load_all()
     logger.info("Incident store ready", restored=restored)
 
+    # 演示种子(默认关):APP_ENABLE_DEMO_SEED=true 时启动即预置 7 条演示事故。
+    # _seed_incidents 幂等 — 已恢复过持久化数据时不重复注入。
+    if config.enable_demo_seed:
+        from app.api.routes import _seed_incidents
+        _seed_incidents()
+        logger.info("Demo incidents seeded", enabled=True)
+
     # 知识库加载（KnowledgeBase 是静态工具类，直接读取模块级常量）
     try:
         from app.data.knowledge_base import KNOWLEDGE_BASE, SERVICE_TOPOLOGY
