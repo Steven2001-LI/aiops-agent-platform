@@ -40,6 +40,7 @@ from app.models.agent import AgentState, AgentStatus, AgentType
 from app.models.evaluation import EvaluationResult, EvaluationType
 from app.models.events import (
     AlertEvent,
+    ApprovalStatus,
     ChangeEvent,
     HealEvent,
     RCAEvent,
@@ -1061,6 +1062,130 @@ async def get_incident(
             detail=f"Incident {incident_id} not found",
         )
 
+    return _incident_to_dict(incident)
+
+
+# =============================================================================
+# 人工审批恢复（审批闭环:pending 挂起后由人批准/拒绝并恢复流程）
+# =============================================================================
+
+
+class ApprovalRequest(PydanticBaseModel):
+    """人工审批请求体"""
+    approver: str = Field(default="admin", description="审批人")
+    comment: str = Field(default="", description="审批意见")
+
+
+async def _get_awaiting_approval_incident(incident_id: str) -> tuple[Incident, ChangeEvent]:
+    """取出停在 AWAITING_APPROVAL 的 incident 并校验可恢复性。
+
+    transition_to 本身不做转移合法性校验,所以这里必须自行拦截:
+    只有 awaiting_approval 状态且带 change_event 的 incident 才能被审批,
+    否则重复 approve 或对任意终态调用都会被放行。
+    """
+    incident = await _incident_service.get(incident_id)
+    if incident is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident {incident_id} not found",
+        )
+    if incident.state != IncidentState.AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Incident {incident_id} is in state '{incident.state.value}'; "
+                "only awaiting_approval incidents can be approved or rejected"
+            ),
+        )
+    if not incident.change_events:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Incident {incident_id} has no change event awaiting approval",
+        )
+    return incident, incident.change_events[-1]
+
+
+@api_router.post(
+    "/incidents/{incident_id}/approve",
+    response_model=dict[str, Any],
+    tags=["Incidents"],
+    summary="人工批准变更",
+    description="批准停在 awaiting_approval 的变更,恢复流水线收尾(模拟执行→RESOLVED)。",
+)
+async def approve_incident(
+    incident_id: str,
+    body: ApprovalRequest | None = None,
+) -> dict[str, Any]:
+    """人工批准:补跑流水线 Step 5 收尾。
+
+    Heal 在挂起前已完成 dry-run,系统的"执行"本就是模拟
+    (resolution_mode="simulated"),因此批准后无需重放任何 Agent,
+    只需标记审批结果并按流水线同款收尾推进到 RESOLVED。
+    """
+    req = body or ApprovalRequest()
+    incident, change_event = await _get_awaiting_approval_incident(incident_id)
+
+    change_event.approval_status = ApprovalStatus.APPROVED
+    change_event.change_details.update(
+        {"approved_by": req.approver, "approval_comment": req.comment}
+    )
+    incident.context["approval_status"] = "approved"
+
+    # 与 _process_incident_pipeline Step 5 相同的收尾
+    incident.context["resolution_mode"] = "simulated"
+    incident.transition_to(IncidentState.RESOLVED, actor=req.approver)
+    await _broadcast_incident(incident)
+
+    try:
+        ms = await _get_memory_system()
+        if ms is not None:
+            archived_count = await ms.flow_wm_to_ltm(incident.incident_id)
+            logger.info(
+                "Working memory archived to LTM after approval",
+                incident_id=incident.incident_id,
+                count=archived_count,
+            )
+    except Exception as e:
+        logger.debug("Failed to archive working memory (non-fatal)", error=str(e))
+
+    logger.info(
+        "Incident change approved by human",
+        incident_id=incident.incident_id,
+        approver=req.approver,
+    )
+    return _incident_to_dict(incident)
+
+
+@api_router.post(
+    "/incidents/{incident_id}/reject",
+    response_model=dict[str, Any],
+    tags=["Incidents"],
+    summary="人工拒绝变更",
+    description="拒绝停在 awaiting_approval 的变更,故障转入 ESCALATED 人工处理。",
+)
+async def reject_incident(
+    incident_id: str,
+    body: ApprovalRequest | None = None,
+) -> dict[str, Any]:
+    """人工拒绝:与流水线 rejected 语义对齐,终态为 ESCALATED。"""
+    req = body or ApprovalRequest()
+    incident, change_event = await _get_awaiting_approval_incident(incident_id)
+
+    change_event.approval_status = ApprovalStatus.REJECTED
+    change_event.change_details.update(
+        {"rejected_by": req.approver, "approval_comment": req.comment}
+    )
+    incident.context["approval_status"] = "rejected"
+
+    await _escalate_pipeline_failure(
+        incident,
+        stage="change",
+        error_message=(
+            f"Change rejected by {req.approver}"
+            + (f": {req.comment}" if req.comment else "")
+        ),
+        actor=req.approver,
+    )
     return _incident_to_dict(incident)
 
 
