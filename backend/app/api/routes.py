@@ -1461,7 +1461,7 @@ async def run_evaluation(
             selected_eval_type = EvaluationType(raw_eval_type)
         except (TypeError, ValueError):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="eval_type is required in query or JSON body",
             )
 
@@ -1503,6 +1503,14 @@ async def run_evaluation(
     # 优先级：显式请求体 > context.scenario_id > incident_id > N/A。
     agent_results: list[dict[str, Any]] = []
     reasoning_samples: list[dict[str, Any]] = []
+    # e2e 用例同样从真实 incident 产物重建(终态 + 有真值才参评),
+    # 不再用 _get_default_test_cases 的预烤 fixture 自评
+    e2e_test_cases: list[dict[str, Any]] = []
+    e2e_terminal_states = (
+        IncidentState.RESOLVED,
+        IncidentState.CLOSED,
+        IncidentState.ESCALATED,
+    )
     ground_truth_sources = {
         "explicit": 0,
         "context_scenario": 0,
@@ -1563,10 +1571,24 @@ async def run_evaluation(
                 }
             )
 
+            # e2e:终态且配到真值的 incident 才产出用例;
+            # expected 取场景真值(root_cause + 建议动作 Top-1)
+            if ground_truth.get("root_cause") and inc.state in e2e_terminal_states:
+                suggested = ground_truth.get("suggested_actions") or [""]
+                e2e_test_cases.append(
+                    EvalAgent._incident_to_test_case(
+                        inc,
+                        {
+                            "root_cause": ground_truth["root_cause"],
+                            "action": suggested[0],
+                        },
+                    )
+                )
+
     eval_input = EvalInput(
         eval_type=mapped_type,
         target_agent=agent_type or "",
-        test_cases=EvalAgent._get_default_test_cases(),
+        test_cases=e2e_test_cases,
         agent_results=agent_results,
         samples_by_type={"reasoning": reasoning_samples},
     )
@@ -1582,7 +1604,7 @@ async def run_evaluation(
     if not result.success or not result.output_data:
         error_message = result.error_message or "Evaluation failed without a report"
         failure_status = (
-            status.HTTP_422_UNPROCESSABLE_ENTITY
+            status.HTTP_422_UNPROCESSABLE_CONTENT
             if "Cannot evaluate" in error_message
             else status.HTTP_500_INTERNAL_SERVER_ERROR
         )
@@ -1851,7 +1873,7 @@ async def store_memory(
     resolved_content = content or str(payload.get("content", ""))
     if not resolved_content.strip():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="content is required",
         )
 

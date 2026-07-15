@@ -22,13 +22,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
+
 from app.evaluation.metrics import (
     automation_rate,
-    detection_accuracy,
     escalation_rate,
-    false_positive_rate,
-    mttr_simulated,
-    resolution_rate,
     task_success_rate,
     weighted_average,
 )
@@ -42,149 +40,6 @@ from app.models.incident import Incident, IncidentState
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-# 预定义的测试数据集：多种故障场景
-DEFAULT_TEST_DATASET: list[dict[str, Any]] = [
-    {
-        "id": "cpu_high_auto_heal",
-        "name": "CPU High - Auto Scale",
-        "alert": {
-            "service": "order-service",
-            "metric": "cpu_usage",
-            "value": 95.0,
-            "threshold": 80.0,
-            "severity": "critical",
-        },
-        "expected": {
-            "root_cause": "traffic_spike",
-            "action": "scale_up",
-            "automated": True,
-            "resolved": True,
-        },
-    },
-    {
-        "id": "memory_leak_restart",
-        "name": "Memory Leak - Restart",
-        "alert": {
-            "service": "payment-service",
-            "metric": "memory_usage",
-            "value": 92.0,
-            "threshold": 85.0,
-            "severity": "high",
-        },
-        "expected": {
-            "root_cause": "memory_leak",
-            "action": "restart",
-            "automated": True,
-            "resolved": True,
-        },
-    },
-    {
-        "id": "db_timeout_escalate",
-        "name": "DB Timeout - Escalate",
-        "alert": {
-            "service": "user-service",
-            "metric": "db_response_time",
-            "value": 5000.0,
-            "threshold": 1000.0,
-            "severity": "critical",
-        },
-        "expected": {
-            "root_cause": "database_connection_pool_exhausted",
-            "action": "escalate",
-            "automated": False,
-            "resolved": False,
-            "escalated": True,
-        },
-    },
-    {
-        "id": "false_positive_normal",
-        "name": "False Positive - Normal",
-        "alert": {
-            "service": "notification-service",
-            "metric": "cpu_usage",
-            "value": 75.0,
-            "threshold": 80.0,
-            "severity": "low",
-        },
-        "expected": {
-            "root_cause": "none",
-            "action": "none",
-            "automated": True,
-            "resolved": True,
-        },
-    },
-    {
-        "id": "dependency_failure",
-        "name": "Dependency Failure - Circuit Breaker",
-        "alert": {
-            "service": "api-gateway",
-            "metric": "error_rate",
-            "value": 25.0,
-            "threshold": 5.0,
-            "severity": "critical",
-        },
-        "expected": {
-            "root_cause": "dependency_failure",
-            "action": "circuit_breaker",
-            "automated": True,
-            "resolved": True,
-        },
-    },
-    {
-        "id": "disk_full_cleanup",
-        "name": "Disk Full - Cleanup",
-        "alert": {
-            "service": "log-aggregator",
-            "metric": "disk_usage",
-            "value": 98.0,
-            "threshold": 90.0,
-            "severity": "high",
-        },
-        "expected": {
-            "root_cause": "log_accumulation",
-            "action": "cleanup_logs",
-            "automated": True,
-            "resolved": True,
-        },
-    },
-    {
-        "id": "network_partition",
-        "name": "Network Partition - Reconnect",
-        "alert": {
-            "service": "cache-cluster",
-            "metric": "network_partition",
-            "value": 1.0,
-            "threshold": 0.0,
-            "severity": "critical",
-        },
-        "expected": {
-            "root_cause": "network_partition",
-            "action": "reconnect",
-            "automated": False,
-            "resolved": False,
-            "escalated": True,
-        },
-    },
-    {
-        "id": "latency_spike",
-        "name": "Latency Spike - Throttle",
-        "alert": {
-            "service": "recommendation-service",
-            "metric": "p99_latency",
-            "value": 3000.0,
-            "threshold": 500.0,
-            "severity": "high",
-        },
-        "expected": {
-            "root_cause": "cache_miss_spike",
-            "action": "throttle",
-            "automated": True,
-            "resolved": True,
-        },
-    },
-]
 
 
 class EndToEndEvaluator:
@@ -232,13 +87,19 @@ class EndToEndEvaluator:
         )
 
         try:
-            # 加载测试样本
-            test_samples = samples or await self._load_default_dataset()
+            # 只吃显式样本:此前空样本会回落预烤 actual_result 的内置默认集,
+            # 等于自己评自己;样本构建职责在调用方(端点/EvalAgent 从真实
+            # incident 产物重建),评测器保持纯函数化。
+            test_samples = samples or []
             result.total_samples = len(test_samples)
 
             if not test_samples:
                 result.status = EvaluationStatus.FAILED
-                result.errors.append("No test samples available")
+                result.errors.append(
+                    "No real evaluation samples provided; build samples from "
+                    "real incident results (POST /evaluations/run) or pass "
+                    "samples containing actual_result explicitly"
+                )
                 result.completed_at = datetime.now(timezone.utc)
                 return result
 
@@ -399,6 +260,18 @@ class EndToEndEvaluator:
 
         for sample in test_samples:
             try:
+                # 缺 actual_result 的样本明确记错,不进指标计算——
+                # 此前空 dict 会让 None==None 的空值比对得满分
+                if "actual_result" not in sample:
+                    results.append(
+                        {
+                            "sample_id": sample.get("id", str(uuid4())),
+                            "error": "missing actual_result",
+                            "success": False,
+                        }
+                    )
+                    continue
+
                 actual = sample.get("actual_result", {})
                 expected = sample.get("expected_result", {})
 
@@ -409,11 +282,14 @@ class EndToEndEvaluator:
                     "automated": actual.get("automated", False),
                     "escalated": actual.get("escalated", False),
                     "resolved": actual.get("resolved", False),
-                    "root_cause_match": (
-                        actual.get("root_cause") == expected.get("root_cause")
+                    # 双方都必须真给出值才算命中,空对空不算
+                    "root_cause_match": bool(
+                        actual.get("root_cause")
+                        and actual.get("root_cause") == expected.get("root_cause")
                     ),
-                    "action_match": (
-                        actual.get("action") == expected.get("action")
+                    "action_match": bool(
+                        actual.get("action")
+                        and actual.get("action") == expected.get("action")
                     ),
                     "processing_time": actual.get("time_to_resolve_seconds", 0),
                     "detection_correct": (
@@ -641,10 +517,6 @@ class EndToEndEvaluator:
             return 0.7 - (processing_time - 300) / 300 * 0.4
         else:
             return max(0.0, 0.3 - (processing_time - 600) / 600 * 0.3)
-
-    async def _load_default_dataset(self) -> list[dict[str, Any]]:
-        """加载默认测试数据集"""
-        return DEFAULT_TEST_DATASET.copy()
 
     def get_eval_history(self) -> list[EvaluationResult]:
         """获取评估历史"""

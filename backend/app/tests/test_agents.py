@@ -12,9 +12,7 @@ AIOps Agent Platform - Unit Tests for All Agents
 
 from __future__ import annotations
 
-import asyncio
 import sys
-from datetime import datetime, timezone
 
 # Ensure the app module is importable
 sys.path.insert(0, "/mnt/agents/output/aiops-agent-platform/backend")
@@ -29,7 +27,7 @@ from app.agents.monitor_agent import (
 )
 from app.agents.rca_agent import BayesianNode, RCAInput, RCAAgent, ServiceImpact
 from app.agents.heal_agent import BlastRadiusResult, CircuitBreaker, CircuitBreakerState, HealInput, HealAgent, HealLevel
-from app.agents.change_agent import ChangeAgent, ChangeInput, RiskFactor
+from app.agents.change_agent import ChangeAgent, ChangeInput
 from app.agents.memory_agent import MemoryAgent, MemoryInput
 from app.agents.eval_agent import EvalAgent, EvalInput, EvalType
 
@@ -37,7 +35,6 @@ from app.models.agent import AgentExecutionContext
 from app.models.events import (
     AlertEvent,
     ApprovalStatus,
-    ChangeEvent,
     HealEvent,
     RCAEvent,
     SeverityLevel,
@@ -974,12 +971,24 @@ class TestEvalAgent:
             assert "expected_result" in case
             assert "actual_result" in case
 
-    def test_eval_end_to_end(self, agent: EvalAgent) -> None:
-        """测试端到端评估"""
+    def test_eval_end_to_end_empty_returns_zero(self, agent: EvalAgent) -> None:
+        """无样本时如实返回 total=0(不再回落预烤 fixture 自评)"""
         from app.agents.eval_agent import EndToEndMetrics
 
         eval_input = EvalInput(
             eval_type=EvalType.END_TO_END,
+        )
+        metrics = agent._eval_end_to_end(eval_input)
+        assert isinstance(metrics, EndToEndMetrics)
+        assert metrics.total_test_cases == 0
+
+    def test_eval_end_to_end_with_explicit_cases(self, agent: EvalAgent) -> None:
+        """显式样本正常计算指标(fixture 仅限测试侧显式传入)"""
+        from app.agents.eval_agent import EndToEndMetrics
+
+        eval_input = EvalInput(
+            eval_type=EvalType.END_TO_END,
+            test_cases=agent._get_default_test_cases(),
         )
         metrics = agent._eval_end_to_end(eval_input)
         assert isinstance(metrics, EndToEndMetrics)
@@ -1075,14 +1084,17 @@ class TestEvalAgent:
         agent: EvalAgent,
         agent_context: AgentExecutionContext,
     ) -> None:
-        """测试端到端评估流程"""
+        """测试端到端评估流程:无样本时维度如实置 not_applicable,不拿 fixture 得分"""
         eval_input = EvalInput(
             eval_type=EvalType.END_TO_END,
         )
         result = await agent.process(eval_input, agent_context)
 
         assert result.success is True
-        assert "end_to_end" in result.output_data.get("report", {})
+        report = result.output_data.get("report", {})
+        assert "end_to_end" in report
+        coverage = report.get("score_coverage", {}).get("end_to_end", {})
+        assert coverage.get("status") == "not_applicable"
 
     def test_eval_history(self, agent: EvalAgent) -> None:
         """测试评估历史"""

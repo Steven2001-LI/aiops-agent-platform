@@ -446,10 +446,10 @@ def test_endpoint_baseline_keys_preserved() -> None:
     client = TestClient(app)
     resp = client.post("/api/v1/evaluations/run?eval_type=end_to_end")
 
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     data = resp.json()
     # 既有 4 key 原样(守住 test_api.py 绿基线)
-    assert data["status"] == "started"
+    assert data["status"] == "completed"
     assert "eval_id" in data
     assert data["eval_type"] == "end_to_end"
     assert "message" in data
@@ -458,17 +458,15 @@ def test_endpoint_baseline_keys_preserved() -> None:
     assert "report" in data
 
 
-def test_endpoint_empty_store_still_202(monkeypatch: pytest.MonkeyPatch) -> None:
-    """空库跑 reasoning:process 因无数据降级为 failure,端点仍 202 + 既有 4 key,增量键优雅缺席。"""
+def test_endpoint_empty_store_returns_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    """空库无可评样本时返回诚实的 422，不再伪报 started。"""
     monkeypatch.setattr(routes_module._incident_service, "_incidents", {})
     client = TestClient(app)
     resp = client.post("/api/v1/evaluations/run?eval_type=reasoning")
 
-    assert resp.status_code == 202
+    assert resp.status_code == 422
     data = resp.json()
-    assert data["status"] == "started"
-    assert "eval_id" in data
-    assert "report" not in data  # 降级:增量键优雅缺席,不 500
+    assert "Cannot evaluate reasoning" in data["detail"]
 
 
 def test_endpoint_judge_on_off(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -499,9 +497,9 @@ def test_endpoint_judge_on_off(monkeypatch: pytest.MonkeyPatch) -> None:
 
     client = TestClient(app)
     resp = client.post("/api/v1/evaluations/run?eval_type=reasoning")
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "started"
+    assert data["status"] == "completed"
     judge = data["report"]["reasoning"]["judge"]
     assert judge is not None
     assert judge["logical_coherence"] == 4
@@ -534,3 +532,53 @@ async def test_judge_determinism() -> None:
     f1 = get_reasoning(r1)["judge"]["fused_reasoning_score"]
     f2 = get_reasoning(r2)["judge"]["fused_reasoning_score"]
     assert f1 == f2
+
+
+@pytest.mark.asyncio
+async def test_endpoint_e2e_uses_real_incidents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """e2e 维度从真实终态 incident + 场景真值重建用例,不再评预烤 fixture。
+
+    种一个 RESOLVED、rca_event 命中 fs_002 真值(memory_leak)的 incident,
+    端点报告的 e2e 应恰好 1 条用例、根因判定与该 incident 真实产物一致。
+    """
+    from app.models.events import AlertEvent, HealEvent, SeverityLevel
+    from app.models.incident import Incident, IncidentState
+
+    alert = AlertEvent(
+        service="payment-service",
+        metric="memory_usage_percent",
+        value=95.0,
+        threshold=80.0,
+        severity=SeverityLevel.CRITICAL,
+    )
+    incident = Incident.from_alert(alert)
+    incident.context["scenario_id"] = "fs_002"
+    incident.rca_event = RCAEvent(
+        incident_id=incident.incident_id,
+        source="rca_agent",
+        root_cause="memory_leak",
+        confidence=0.8,
+        impact_chain=["payment-service"],
+    )
+    incident.heal_events.append(
+        HealEvent(incident_id=incident.incident_id, action="restart_pod")
+    )
+    incident.transition_to(IncidentState.RESOLVED, actor="test")
+
+    monkeypatch.setattr(
+        routes_module._incident_service,
+        "_incidents",
+        {incident.incident_id: incident},
+    )
+
+    client = TestClient(app)
+    resp = client.post("/api/v1/evaluations/run?eval_type=end_to_end")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    e2e = data["report"]["end_to_end"]
+    # 用例数 == 真实 incident 数(1),而非 5 条 fixture
+    assert e2e["total_test_cases"] == 1
+    # RESOLVED 的真实 incident → 成功率/检测准确率如实为 1.0
+    assert e2e["task_success_rate"] == 1.0
+    assert e2e["detection_accuracy"] == 1.0

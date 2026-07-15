@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -33,44 +33,23 @@ from app.config import get_config
 from app.evaluation.core import get_evaluation_framework
 from app.evaluation.end_to_end import EndToEndEvaluator
 from app.evaluation.metrics import (
-    accuracy,
-    automation_rate,
+    answer_faithfulness,
+    answer_relevance,
     confidence_calibration,
-    escalation_rate,
-    false_positive_rate,
-    mae,
-    mse,
-    mttr_simulated,
-    precision_recall_f1,
-    resolution_rate,
+    context_relevance,
+    context_sufficiency,
     retrieval_precision,
     retrieval_recall,
-    root_cause_accuracy,
-    task_success_rate,
-    tool_execution_success,
-    tool_selection_accuracy,
-    weighted_average,
 )
 from app.evaluation.rag_eval import RAGEvaluator
 from app.evaluation.reasoning_eval import ReasoningEvaluator
 from app.evaluation.tool_call_eval import ToolCallEvaluator
 from app.models.agent import AgentExecutionContext
 from app.models.evaluation import (
-    BenchmarkReport,
     EvaluationResult,
-    EvaluationStatus,
     EvaluationType,
 )
-from app.models.events import (
-    AlertEvent,
-    ApprovalStatus,
-    AuditEvent,
-    EventStatus,
-    HealEvent,
-    RCAEvent,
-    SeverityLevel,
-)
-from app.models.incident import Incident, IncidentMetrics, IncidentPhase, IncidentState
+from app.models.incident import Incident, IncidentState
 from app.services.llm_service import LLMService, LLMUnavailableError, get_llm_service
 from app.utils.logging import get_logger
 
@@ -314,12 +293,12 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             # 无有有效样本的维度不调标准评测器，避免其内部默认数据集
             # 为本次真实空数据生成伪 benchmark 分数。
             if report.score_coverage["end_to_end"]["status"] == "evaluated":
+                # coverage 门保证走到这里必有真实样本;
+                # 不做默认 fixture 兜底(那是预烤 actual_result 的自评)
                 e2e_samples = (
                     input_data.samples_by_type.get("end_to_end")
                     or input_data.test_cases
                 )
-                if not e2e_samples:
-                    e2e_samples = self._get_default_test_cases()
                 e2e_result = await self._framework.evaluate(
                     EvaluationType.END_TO_END,
                     target_agent=input_data.target_agent,
@@ -486,12 +465,11 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         端到端评估
 
         评估完整故障处理流程的成功率、MTTR 等指标。
+        无样本时返回 total=0 的空指标(score_coverage 会把该维度置
+        not_applicable 并踢出总分),不做默认 fixture 兜底——预烤的
+        完美 actual_result 打出来的是自评分。
         """
         test_cases = input_data.test_cases
-        agent_results = input_data.agent_results
-
-        if not test_cases:
-            test_cases = self._get_default_test_cases()
 
         total = len(test_cases)
         if total == 0:
@@ -506,7 +484,6 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         automated = 0
 
         for case in test_cases:
-            case_result = case.get("expected_result", {})
             actual_result = case.get("actual_result", {})
 
             # 任务成功
@@ -1015,9 +992,6 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
             scores.extend(retrieved_scores)
 
-        n_prec = len(precisions) if precisions else 1
-        n_rec = len(recalls) if recalls else 1
-
         avg_precision = float(np.mean(precisions)) if precisions else 0.0
         avg_recall = float(np.mean(recalls)) if recalls else 0.0
         retrieval_f1 = (
@@ -1480,7 +1454,12 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
 
     @staticmethod
     def _get_default_test_cases() -> list[dict[str, Any]]:
-        """获取默认测试用例"""
+        """演示/单测 fixture:预烤的完美 actual_result。
+
+        禁止作为生产评分路径的兜底——用它打分等于自己评自己。
+        生产 e2e 样本由 /evaluations/run 从真实 incident 产物重建
+        (_incident_to_test_case + FAULT_SCENARIOS 真值配对)。
+        """
         return [
             {
                 "name": "cpu_high_auto_heal",

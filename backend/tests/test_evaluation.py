@@ -30,25 +30,17 @@ class TestEndToEndEvaluation:
         return EndToEndEvaluator()
 
     @pytest.mark.asyncio
-    async def test_end_to_end_metrics(self, evaluator: EndToEndEvaluator) -> None:
-        """
-        测试端到端指标计算
-
-        确保各项端到端指标被正确计算。
-        """
+    async def test_end_to_end_refuses_without_samples(
+        self, evaluator: EndToEndEvaluator
+    ) -> None:
+        """无显式样本时明确拒绝——不再回落预烤 actual_result 的内置默认集自评"""
         result = await evaluator.evaluate(target_agent="test_agent")
 
         assert isinstance(result, EvaluationResult)
         assert result.evaluation_type == EvaluationType.END_TO_END
-        assert result.status in [EvaluationStatus.COMPLETED, EvaluationStatus.FAILED]
-
-        if result.status == EvaluationStatus.COMPLETED:
-            assert result.total_samples > 0
-            assert len(result.metric_scores) > 0
-
-            # 检查关键指标
-            metric_names = [m.metric_name for m in result.metric_scores]
-            assert "task_success_rate" in metric_names
+        assert result.status == EvaluationStatus.FAILED
+        assert result.total_samples == 0
+        assert any("real" in e.lower() or "样本" in e for e in result.errors)
 
     @pytest.mark.asyncio
     async def test_end_to_end_with_samples(self, evaluator: EndToEndEvaluator) -> None:
@@ -90,9 +82,40 @@ class TestEndToEndEvaluation:
         result = await evaluator.evaluate(target_agent="test_agent", samples=samples)
 
         assert isinstance(result, EvaluationResult)
-        if result.status == EvaluationStatus.COMPLETED:
-            assert result.total_samples == 2
-            assert len(result.metric_scores) > 0
+        # 硬断言 COMPLETED:此前包在 if 里,FAILED 会静默通过
+        assert result.status == EvaluationStatus.COMPLETED
+        assert result.total_samples == 2
+        assert len(result.metric_scores) > 0
+
+    @pytest.mark.asyncio
+    async def test_evaluate_batch_missing_actual_result(
+        self, evaluator: EndToEndEvaluator
+    ) -> None:
+        """缺 actual_result 的样本记错误,不产生空值比对的假满分"""
+        batch = await evaluator.evaluate_batch(
+            [{"id": "no-actual", "expected_result": {"root_cause": "memory_leak"}}]
+        )
+        assert len(batch) == 1
+        assert batch[0]["success"] is False
+        assert "error" in batch[0]
+        assert "root_cause_match" not in batch[0]
+
+    @pytest.mark.asyncio
+    async def test_root_cause_match_not_vacuous(
+        self, evaluator: EndToEndEvaluator
+    ) -> None:
+        """actual 未给出根因时不得与空 expected 匹配成 True"""
+        batch = await evaluator.evaluate_batch(
+            [
+                {
+                    "id": "vacuous",
+                    "actual_result": {"resolved": True},
+                    "expected_result": {},
+                }
+            ]
+        )
+        assert batch[0]["root_cause_match"] is False
+        assert batch[0]["action_match"] is False
 
     def test_time_score_calculation(self, evaluator: EndToEndEvaluator) -> None:
         """测试处理时间分数计算"""

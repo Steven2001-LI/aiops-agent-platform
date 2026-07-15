@@ -23,7 +23,7 @@
 
 两种引擎的已知差异（如实声明）：langgraph 引擎不含 Monitor 异常确认阶段（receive_alert → triage 直接进 RCA），不写入记忆系统，事件字段挂载与终态语义（RESOLVED / AWAITING_APPROVAL / ESCALATED）与 legacy 一致，另会在 `context` 里附加 `orchestrator.*` 的各节点产物。
 
-Candidate Evaluation 不会在 Incident Pipeline 结束后自动运行；需要通过独立的 `POST /api/v1/evaluations/run` 端点手动触发。
+Candidate Evaluation 不会在 Incident Pipeline 结束后自动运行；需要通过独立的 `POST /api/v1/evaluations/run` 端点手动触发，接口在评测完成后同步返回报告。
 
 ## 架构图
 
@@ -176,15 +176,17 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 
 [`eval_agent.py`](backend/app/agents/eval_agent.py) 实现了四维度（端到端 / 推理 / 工具调用 / RAG）评测框架，指标包括根因准确率、置信度校准、检索精确率等，并支持可选的 LLM-as-Judge 对推理链做融合评分（可配置独立 `judge_model` 防同源偏置）。评测通过独立的 `POST /api/v1/evaluations/run` 端点手动触发，不是 Incident Pipeline 的自动下游步骤。
 
-定位说明：这是 **Candidate Evaluation（候选评测）**——在内置模拟场景与默认测试集上运行的候选指标，用于演示评测方法论，不是 Accepted Baseline，不构成对系统真实效果的验收结论。
+定位说明：这是 **Candidate Evaluation（候选评测）**——对真实跑过的 incident 产物按内置模拟场景真值配对计算的候选指标（无真值/无产物的维度按 `score_coverage` 如实置 N/A），用于演示评测方法论，不是 Accepted Baseline，不构成对系统真实效果的验收结论。
 
 ## 测试验证证据
 
 ```text
-Full-suite verification (2026-07-15, 全景地图问题修复轮之后):
-402 passed / 1 skipped / 0 failed
+Full-suite verification (2026-07-15, API 契约与质量门禁修复轮之后):
+409 passed / 1 skipped / 0 failed
 Backend Docker image build: passed
 Runtime data module import: passed
+Frontend ESLint / production build: passed
+Backend Ruff / Docker Compose config: passed
 ```
 
 以上为在该次验证日期由当前依赖约束解析出的环境中完成的一次干净克隆验证，用于证明仓库自洽可构建、测试套件全绿；不代表生产 SLA 或线上质量承诺。
