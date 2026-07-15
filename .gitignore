@@ -90,6 +90,8 @@ docs/*-task*.md
 docs/*-review*.md
 docs/*-plan*.md
 docs/d7-benchmark*.md
+# 学习用全景分析报告(含简历口径与弱点点评),不入公开历史
+docs/项目全景地图.html
 
 # 面试素材截图(Langfuse trace / 评测面板等),含账号/项目信息,不入公开历史
 docs/screenshots/
