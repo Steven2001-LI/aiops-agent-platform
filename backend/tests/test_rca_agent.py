@@ -583,3 +583,28 @@ class TestCandidateCauses:
         }
         bayes_scores = [c["score"] for c in candidates if c["cause"] in bayes_names]
         assert bayes_scores == sorted(bayes_scores, reverse=True)
+
+    def test_naive_timestamp_does_not_crash(self, tmp_path, monkeypatch) -> None:
+        """合法但无时区的 ISO 时间戳按 UTC 补齐,不抛 naive/aware TypeError"""
+        import app.agents.rca_agent as rca_module
+        from app.services.incident_service import IncidentService
+
+        agent = RCAAgent(
+            incident_service=IncidentService(db_path=str(tmp_path / "naive.db"))
+        )
+        monkeypatch.setattr(
+            rca_module,
+            "get_change_records",
+            lambda service: [
+                {
+                    "service": service,
+                    "type": "deployment",
+                    # naive ISO(无时区),旧实现与 aware since 比较会崩
+                    "timestamp": "2026-07-15T12:00:00",
+                    "author": "dev",
+                    "description": "naive ts",
+                }
+            ],
+        )
+        # 不抛异常即为通过;窗口外(旧时间)应被过滤为空
+        assert agent._find_recent_changes("payment-service", lookback_minutes=60) == []

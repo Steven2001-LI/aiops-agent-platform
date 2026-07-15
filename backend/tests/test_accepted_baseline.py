@@ -59,16 +59,15 @@ async def test_baseline_reproducible_in_process() -> None:
         "基线不可复现:当前代码的确定性结果与入库基线不一致,"
         "若为有意的行为变更请重新生成并接受基线"
     )
+    # 零容差覆盖入库聚合的全部 reasoning 指标(judge 生成时已剔除)
+    # 与 overall_score,不留未守护的指标
     agg = doc["aggregate"]["reasoning"]
     reasoning = report["reasoning"]
-    for metric in (
-        "root_cause_accuracy",
-        "root_cause_top3_hit_rate",
-        "suggested_action_accuracy",
-        "evidence_completeness",
-        "confidence_calibration_error",
-    ):
-        assert reasoning[metric] == agg[metric], f"{metric} 与入库基线不一致"
+    for metric, expected in agg.items():
+        assert reasoning[metric] == expected, f"{metric} 与入库基线不一致"
+    assert report["overall_score"] == doc["aggregate"]["overall_score"], (
+        "overall_score 与入库基线不一致"
+    )
 
 
 def test_generator_refuses_when_llm_enabled(monkeypatch: pytest.MonkeyPatch) -> None:

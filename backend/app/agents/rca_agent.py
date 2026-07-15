@@ -556,6 +556,10 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
                 t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except ValueError:
                 t = None
+            # 合法但不带时区的 ISO 时间会解析成 naive datetime,
+            # 与 aware 的 since 比较会抛 TypeError;按 UTC 补齐
+            if t is not None and t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
             if t is not None and t < since:
                 continue
             changes.append({

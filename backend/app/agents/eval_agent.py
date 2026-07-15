@@ -534,8 +534,13 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         无样本时返回 total=0 的空指标(score_coverage 会把该维度置
         not_applicable 并踢出总分),不做默认 fixture 兜底——预烤的
         完美 actual_result 打出来的是自评分。
+        样本来源与框架调用/覆盖判定统一:samples_by_type["end_to_end"]
+        优先,回退 test_cases(此前只读 test_cases,导致仅经
+        samples_by_type 传入的有效样本被覆盖门禁判成 not_applicable)。
         """
-        test_cases = input_data.test_cases
+        test_cases = (
+            input_data.samples_by_type.get("end_to_end") or input_data.test_cases
+        )
 
         total = len(test_cases)
         if total == 0:
@@ -1160,8 +1165,9 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
         RAG 评估
 
         评估知识库检索的准确性和相关性。
+        样本来源与框架调用/覆盖判定统一(samples_by_type["rag"] 优先)。
         """
-        test_cases = input_data.test_cases
+        test_cases = input_data.samples_by_type.get("rag") or input_data.test_cases
 
         if not test_cases:
             return RAGMetrics()
@@ -1389,7 +1395,12 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             "context_sufficiency": 0,
         }
         if requested["rag"]:
-            for case in input_data.test_cases:
+            # 与 _eval_rag/框架调用同一样本来源,覆盖判定不再漏看
+            # 仅经 samples_by_type 传入的有效样本
+            rag_cases = (
+                input_data.samples_by_type.get("rag") or input_data.test_cases
+            )
+            for case in rag_cases:
                 retrieved = case.get("retrieved_docs", [])
                 relevant = case.get("relevant_docs", [])
                 contexts = [

@@ -622,3 +622,58 @@ class TestIncidentToTestCaseHonesty:
         incident.timeline = []
         case = EvalAgent._incident_to_test_case(incident, {})
         assert case["actual_result"]["time_to_resolve_seconds"] is None
+
+
+class TestSamplesByTypeUnified:
+    """Codex 建议 1 回归:仅经 samples_by_type 传入的样本,覆盖判定与执行一致"""
+
+    def test_e2e_samples_by_type_only_is_evaluated(self) -> None:
+        agent = EvalAgent()
+        sample = {
+            "id": "sbt-e2e",
+            "is_anomaly": True,
+            "actual_result": {
+                "resolved": True,
+                "is_anomaly": True,
+                "escalated": False,
+                "root_cause": "memory_leak",
+                "action": "restart_pod",
+                "time_to_resolve_seconds": 60,
+            },
+            "expected_result": {"root_cause": "memory_leak", "action": "restart_pod"},
+        }
+        eval_input = EvalInput(
+            eval_type=EvalType.END_TO_END,
+            samples_by_type={"end_to_end": [sample]},
+        )
+        metrics = agent._eval_end_to_end(eval_input)
+        assert metrics.total_test_cases == 1
+        assert metrics.task_success_rate == 1.0
+
+        from app.agents.eval_agent import EvalReport
+
+        report = EvalReport(eval_type="end_to_end")
+        report.end_to_end = metrics
+        coverage = agent._build_score_coverage(eval_input, report)
+        assert coverage["end_to_end"]["status"] == "evaluated"
+
+    def test_rag_samples_by_type_only_is_evaluated(self) -> None:
+        agent = EvalAgent()
+        sample = {
+            "id": "sbt-rag",
+            "query": "mysql timeout",
+            "generated_answer": "connection pool exhausted",
+            "retrieved_docs": [{"id": "d1", "content": "mysql pool exhausted"}],
+            "relevant_docs": ["d1"],
+        }
+        eval_input = EvalInput(
+            eval_type=EvalType.RAG,
+            samples_by_type={"rag": [sample]},
+        )
+        metrics = agent._eval_rag(eval_input)
+        from app.agents.eval_agent import EvalReport
+
+        report = EvalReport(eval_type="rag")
+        report.rag = metrics
+        coverage = agent._build_score_coverage(eval_input, report)
+        assert coverage["rag"]["status"] == "evaluated"
