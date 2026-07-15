@@ -146,7 +146,7 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 1. HTTP API 默认执行手写顺序管道；LangGraph 状态机经 `APP_PIPELINE_ENGINE=langgraph` 可承接 HTTP 请求，但不含 Monitor 阶段、不写记忆系统（见上文两引擎差异）。
 2. Heal Agent 只生成 Playbook 匹配结果、Dry-Run 模拟与风险评估，不对任何真实基础设施执行修复。
 3. 审批 `pending` 暂停后可经 `POST /api/v1/incidents/{id}/approve|reject` 人工恢复（approve 补跑模拟收尾，reject 转人工升级）。
-4. Chroma 使用本地 `PersistentClient` 持久化，主代码未接入独立 Chroma 服务容器。
+4. Chroma 支持双模式：默认嵌入式 `PersistentClient` 本地持久化；设置 `CHROMA_HOST` 后切换 `HttpClient` 连接独立服务（docker-compose 已把后端指向 chroma 容器）。
 5. 服务拓扑、指标数据、故障场景、业务事件均来自内置模拟数据集（[`backend/app/data/`](backend/app/data/)）。
 6. 本项目不声称生产可用，不声称降低真实 MTTR，不声称实现线上自动自愈。
 

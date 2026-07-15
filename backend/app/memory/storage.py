@@ -485,11 +485,30 @@ class ChromaDBStorage(BaseStorage):
 
     def __init__(
         self,
-        collection_name: str = "aiops_memory",
+        collection_name: str | None = None,
         persist_directory: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
     ) -> None:
-        self.collection_name = collection_name
-        self.persist_directory = persist_directory or "./data/chromadb"
+        # 显式参数优先,缺省回退 CHROMA_* 配置(config.ChromaConfig);
+        # host 非空 → HttpClient 服务端模式,否则嵌入式 PersistentClient
+        chroma_cfg = None
+        try:
+            from app.config import get_config
+            chroma_cfg = get_config().chroma
+        except Exception:  # 配置系统不可用时保持历史默认值
+            pass
+
+        self.collection_name = collection_name or (
+            chroma_cfg.collection_name if chroma_cfg else "aiops_memory"
+        )
+        self.persist_directory = persist_directory or (
+            chroma_cfg.db_path if chroma_cfg else "./data/chromadb"
+        )
+        self.host = host if host is not None else (
+            chroma_cfg.host if chroma_cfg else None
+        )
+        self.port = port or (chroma_cfg.port if chroma_cfg else 8000)
         self._client: Any = None
         self._collection: Any = None
         self._initialized: bool = False
@@ -508,13 +527,20 @@ class ChromaDBStorage(BaseStorage):
                 import chromadb
                 from chromadb.config import Settings
 
-                self._client = chromadb.PersistentClient(
-                    path=self.persist_directory,
-                    settings=Settings(
-                        anonymized_telemetry=False,
-                        allow_reset=True,
-                    ),
-                )
+                if self.host:
+                    self._client = chromadb.HttpClient(
+                        host=self.host,
+                        port=self.port,
+                        settings=Settings(anonymized_telemetry=False),
+                    )
+                else:
+                    self._client = chromadb.PersistentClient(
+                        path=self.persist_directory,
+                        settings=Settings(
+                            anonymized_telemetry=False,
+                            allow_reset=True,
+                        ),
+                    )
                 self._collection = self._client.get_or_create_collection(
                     name=self.collection_name,
                     metadata={"description": "AIOps memory storage"},
@@ -523,7 +549,8 @@ class ChromaDBStorage(BaseStorage):
                 logger.info(
                     "ChromaDB initialized",
                     collection=self.collection_name,
-                    persist_dir=self.persist_directory,
+                    mode="http" if self.host else "embedded",
+                    server=f"{self.host}:{self.port}" if self.host else self.persist_directory,
                 )
 
             except ImportError:

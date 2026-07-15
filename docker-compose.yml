@@ -67,10 +67,11 @@ services:
       # --- WebSocket 配置 ---
       - WS_HEARTBEAT_INTERVAL_SECONDS=30
       - WS_MAX_CONNECTIONS=100
-      # --- ChromaDB 配置 ---
-      - CHROMA_DB_PATH=./data/chroma
-      - CHROMA_DB_HOST=chroma
-      - CHROMA_DB_PORT=8000
+      # --- ChromaDB 配置(设置 CHROMA_HOST 后后端走 HttpClient 连独立容器;
+      #     注释掉 CHROMA_HOST 则回退嵌入式 PersistentClient 写 ./data/chromadb) ---
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - CHROMA_COLLECTION_NAME=aiops_memory
     volumes:
       # 数据持久化（SQLite + ChromaDB本地缓存）
       - aiops-data:/app/data
@@ -125,7 +126,8 @@ services:
     networks:
       - aiops-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "-s", "http://localhost:8000/api/v1/heartbeat"]
+      # 新版镜像(1.x)心跳在 /api/v2/heartbeat,旧版在 /api/v1/heartbeat,两者兼容
+      test: ["CMD-SHELL", "curl -f -s http://localhost:8000/api/v2/heartbeat || curl -f -s http://localhost:8000/api/v1/heartbeat"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -134,6 +134,33 @@ class MemoryConfig(BaseSettings):
     )
 
 
+class ChromaConfig(BaseSettings):
+    """ChromaDB 配置
+
+    host 为空(默认)时使用嵌入式 PersistentClient 持久化到 db_path;
+    设置 CHROMA_HOST(如 docker-compose 里的 chroma 容器)时切换为
+    HttpClient 服务端模式。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="CHROMA_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    host: str | None = Field(
+        default=None, description="ChromaDB 服务地址;空 = 嵌入式模式"
+    )
+    port: int = Field(default=8000, gt=0, description="ChromaDB 服务端口")
+    db_path: str = Field(
+        default="./data/chromadb", description="嵌入式模式持久化目录"
+    )
+    collection_name: str = Field(
+        default="aiops_memory", description="集合名称"
+    )
+
+
 class WebSocketConfig(BaseSettings):
     """WebSocket 配置"""
 
@@ -192,6 +219,7 @@ class AppConfig(BaseSettings):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    chroma: ChromaConfig = Field(default_factory=ChromaConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
 
     @field_validator("cors_origins", mode="before")
