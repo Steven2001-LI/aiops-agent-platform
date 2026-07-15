@@ -13,11 +13,18 @@ export interface Alert {
   algorithms_voted: string[];
 }
 
+export interface CandidateCause {
+  cause: string;
+  score: number;
+}
+
 export interface RCA {
   root_cause: string;
   confidence: number;
   impact_chain: string[];
   suggested_actions: string[];
+  // 候选根因 Top-K(旧数据/context 兜底路径可能缺失,按可选处理)
+  candidate_causes?: CandidateCause[];
 }
 
 export interface Heal {

@@ -359,6 +359,16 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
                 if action not in suggested_actions:
                     suggested_actions.append(action)
 
+        # 候选根因 Top-K(规则/LLM 路径在此已汇合,三种 reasoning_mode 共用):
+        # 贝叶斯后验 Top-5 为基;llm_hybrid 覆写的根因不在其中时按最终
+        # confidence 补插首位,保证 root_cause 必在候选列表中
+        candidate_causes = [
+            {"cause": r.name, "score": round(r.posterior, 4)}
+            for r in bayesian_results[:5]
+        ]
+        if root_cause and all(c["cause"] != root_cause for c in candidate_causes):
+            candidate_causes.insert(0, {"cause": root_cause, "score": confidence})
+
         # 构建 RCAEvent
         rca_event = RCAEvent(
             correlation_id=alert.correlation_id,
@@ -366,6 +376,7 @@ class RCAAgent(BaseAgent[RCAInput, RCAEvent]):
             incident_id=input_data.incident_id,
             root_cause=root_cause,
             confidence=confidence,
+            candidate_causes=candidate_causes,
             impact_chain=[i.service for i in impact_chain],
             contributing_factors=[r.name for r in bayesian_results[:3]],
             evidence={

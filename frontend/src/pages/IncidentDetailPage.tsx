@@ -44,6 +44,8 @@ export function IncidentDetailPage() {
   const { incidents, updateIncident } = useAppStore();
   const { getIncident, approveIncident, rejectIncident, loading } = useIncidents();
   const [apiIncident, setApiIncident] = useState<Incident | null>(null);
+  const [approvalError, setApprovalError] = useState('');
+  const [approvalSubmitting, setApprovalSubmitting] = useState(false);
 
   // Try loading from API if not in store
   useEffect(() => {
@@ -168,35 +170,25 @@ export function IncidentDetailPage() {
   };
 
   const applyApprovalDecision = async (decision: 'approve' | 'reject') => {
-    // 真实闭环:调后端审批恢复接口,以后端返回的 incident 状态为准
-    // (approve → resolved,reject → escalated)
+    // 真实闭环:只接受后端返回的审批结果，失败时不伪造本地终态。
     const call = decision === 'approve' ? approveIncident : rejectIncident;
+    setApprovalError('');
+    setApprovalSubmitting(true);
     try {
       const result = await call(incident.id, 'admin', '');
-      if (result) {
-        const mapped = mapApiIncident(
-          result as unknown as Record<string, unknown>,
-          incident.id
-        );
-        setApiIncident(mapped);
-        updateIncident({ ...incident, ...mapped });
-        return;
-      }
-    } catch (_e) {
-      // 后端不可达/不认识该 incident 时走下方本地兜底
+      const mapped = mapApiIncident(
+        result as unknown as Record<string, unknown>,
+        incident.id
+      );
+      setApiIncident(mapped);
+      updateIncident({ ...incident, ...mapped });
+    } catch (error) {
+      setApprovalError(
+        error instanceof Error ? error.message : '审批请求失败，请稍后重试'
+      );
+    } finally {
+      setApprovalSubmitting(false);
     }
-    // 兜底:仅用于后端没有登记的纯前端演示数据,状态语义与后端对齐
-    updateIncident({
-      ...incident,
-      status: decision === 'approve' ? 'resolved' : 'escalated',
-      change: {
-        ...incident.change,
-        approval_status: decision === 'approve' ? 'approved' : 'rejected',
-        risk_score: incident.change?.risk_score ?? 50,
-        approver: 'admin',
-      },
-      updated_at: new Date().toISOString(),
-    });
   };
 
   const handleApprove = () => {
@@ -248,10 +240,11 @@ export function IncidentDetailPage() {
               执行修复
             </button>
           )}
-          {incident.status === 'healing' && incident.change?.approval_status === 'pending' && (
+          {incident.status === 'awaiting_approval' && incident.change?.approval_status === 'pending' && (
             <>
               <button
                 onClick={handleApprove}
+                disabled={approvalSubmitting}
                 className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700 transition-colors"
               >
                 <CheckCircle className="w-4 h-4" />
@@ -259,6 +252,7 @@ export function IncidentDetailPage() {
               </button>
               <button
                 onClick={handleReject}
+                disabled={approvalSubmitting}
                 className="inline-flex items-center gap-2 px-3 py-2 bg-red-600 text-white rounded-lg text-sm hover:bg-red-700 transition-colors"
               >
                 <XCircle className="w-4 h-4" />
@@ -268,6 +262,12 @@ export function IncidentDetailPage() {
           )}
         </div>
       </div>
+
+      {approvalError && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400">
+          {approvalError}
+        </div>
+      )}
 
       {/* Basic Info */}
       <div className="glass-card p-5">
@@ -413,6 +413,43 @@ export function IncidentDetailPage() {
                   </span>
                 </div>
               </div>
+              {incident.rca.candidate_causes &&
+                incident.rca.candidate_causes.length > 1 && (
+                  <div>
+                    <span className="text-sm text-muted-foreground">
+                      候选根因 Top-{incident.rca.candidate_causes.length}
+                    </span>
+                    <div className="space-y-1.5 mt-2">
+                      {incident.rca.candidate_causes.map((c) => (
+                        <div
+                          key={c.cause}
+                          className="flex items-center justify-between gap-2"
+                        >
+                          <span
+                            className={`text-xs ${
+                              c.cause === incident.rca!.root_cause
+                                ? 'text-amber-400 font-medium'
+                                : 'text-muted-foreground'
+                            }`}
+                          >
+                            {c.cause}
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <div className="w-16 h-1.5 bg-muted rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-amber-400/70 rounded-full"
+                                style={{ width: `${c.score * 100}%` }}
+                              />
+                            </div>
+                            <span className="text-xs text-muted-foreground w-10 text-right">
+                              {(c.score * 100).toFixed(1)}%
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               <div>
                 <span className="text-sm text-muted-foreground">影响链</span>
                 <div className="flex flex-wrap gap-1.5 mt-2">

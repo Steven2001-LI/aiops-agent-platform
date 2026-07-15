@@ -173,6 +173,14 @@ class RCAEvent(BaseEvent):
         default_factory=list,
         description=" contributing factors（ Contributing factors 列表）",
     )
+    candidate_causes: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "候选根因 Top-K,元素 {cause: str, score: float},按 score 降序。"
+            "score 为归一化置信分(贝叶斯路径即后验;LLM 覆写根因不在贝叶斯"
+            " Top-5 时按最终 confidence 补插首位)。root_cause 必在列表中。"
+        ),
+    )
     evidence: dict[str, Any] = Field(
         default_factory=dict,
         description="支撑证据(指标数据、日志片段等)",

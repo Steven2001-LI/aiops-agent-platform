@@ -498,3 +498,41 @@ async def test_webhook_pipeline_uses_execute_not_process(monkeypatch: pytest.Mon
         "awaiting_approval",
         "resolved",
     ]
+
+
+# =============================================================================
+# 候选根因 Top-K 经 API 摊平透出(_incident_to_dict 两条分支)
+# =============================================================================
+
+
+def test_incident_to_dict_exposes_candidate_causes() -> None:
+    """rca_event 分支:candidate_causes 原样透出"""
+    incident_id = "inc-cand-dict"
+    incident = _incident()
+    candidates = [
+        {"cause": "traffic_spike", "score": 0.91},
+        {"cause": "memory_leak", "score": 0.42},
+    ]
+    incident.rca_event = RCAEvent(
+        incident_id=incident_id,
+        root_cause="traffic_spike",
+        confidence=0.91,
+        candidate_causes=candidates,
+    )
+
+    data = routes._incident_to_dict(incident)
+    assert data["rca"]["candidate_causes"] == candidates
+
+
+def test_incident_to_dict_candidate_causes_context_fallback() -> None:
+    """context 兜底分支:无 rca_event 时读 rca_candidate_causes,缺省空列表"""
+    incident = _incident()
+    incident.context["rca_root_cause"] = "traffic_spike"
+    incident.context["rca_confidence"] = 0.8
+
+    data = routes._incident_to_dict(incident)
+    assert data["rca"]["candidate_causes"] == []
+
+    incident.context["rca_candidate_causes"] = [{"cause": "traffic_spike", "score": 0.8}]
+    data = routes._incident_to_dict(incident)
+    assert data["rca"]["candidate_causes"] == [{"cause": "traffic_spike", "score": 0.8}]

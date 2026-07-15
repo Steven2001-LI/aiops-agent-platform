@@ -713,3 +713,34 @@ async def test_enabled_without_api_key_falls_back(
     assert evidence["reasoning_mode"] == "rule_fallback"
     assert "llm_meta" not in evidence
     assert "reasoning_chain" not in evidence
+
+
+# =============================================================================
+# 候选根因 Top-K:LLM 覆写根因不在贝叶斯 Top-5 时补插首位
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_candidate_causes_llm_out_of_set(
+    agent_context: AgentExecutionContext,
+) -> None:
+    alert = make_alert()
+    probe = RCAAgent()
+    top5 = {r.name for r in probe.bayesian_inference(probe._extract_symptoms(alert))[:5]}
+    llm_cause = next(k for k in RCAAgent.PRIOR_PROBABILITIES if k not in top5)
+
+    svc, fake = make_rca_service([make_fake_response(valid_llm_json(llm_cause, 0.9))])
+    agent = make_agent(svc)
+    result = await agent.process(
+        RCAInput(alert=alert, incident_id="inc-cand-oos"), agent_context
+    )
+
+    assert result.success is True
+    assert len(fake.calls) == 1
+    rca_event = result.output_data["rca_event"]
+    candidates = rca_event["candidate_causes"]
+    # LLM 根因不在贝叶斯 Top-5 → 补插首位,score 为最终 confidence
+    assert candidates[0]["cause"] == llm_cause
+    assert candidates[0]["score"] == result.output_data["confidence"]
+    # 原贝叶斯 Top-5 完整保留在其后
+    assert {c["cause"] for c in candidates[1:]} == top5

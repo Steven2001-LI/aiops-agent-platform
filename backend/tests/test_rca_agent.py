@@ -524,3 +524,62 @@ class TestFindRecentChanges:
         order_entry = next(e for e in detail if e["service"] == "order-service")
         assert isinstance(order_entry["related_changes"], list)
         assert len(order_entry["related_changes"]) <= 3
+
+
+class TestCandidateCauses:
+    """候选根因 Top-K 正式暴露(RCAEvent.candidate_causes)"""
+
+    @pytest.mark.asyncio
+    async def test_candidate_causes_rule_path(self) -> None:
+        """规则路径:候选=贝叶斯 Top-5(+必要时补插的最终根因),evidence 旧键不动"""
+        agent = RCAAgent()
+        alert = AlertEvent(
+            service="order-service",
+            metric="cpu_usage_percent",
+            value=95.0,
+            threshold=80.0,
+            severity=SeverityLevel.HIGH,
+        )
+        result = await agent.process(
+            RCAInput(alert=alert, incident_id="inc-cand"),
+            AgentExecutionContext(incident_id="inc-cand", input_data={}),
+        )
+
+        assert result.success is True
+        rca_event = result.output_data["rca_event"]
+        candidates = rca_event["candidate_causes"]
+        assert 0 < len(candidates) <= 6
+        assert all("cause" in c and "score" in c for c in candidates)
+        assert all(0.0 <= c["score"] <= 1.0 for c in candidates)
+        # 最终根因必在候选列表中
+        assert rca_event["root_cause"] in [c["cause"] for c in candidates]
+        # 贝叶斯段与 evidence["bayesian_top_causes"](posterior 键名,eval
+        # judge 证据包依赖)同序 —— 旧键必须原样保留
+        bayes = rca_event["evidence"]["bayesian_top_causes"]
+        assert all("posterior" in c for c in bayes)
+        bayes_names = [c["cause"] for c in bayes]
+        tail = [c["cause"] for c in candidates if c["cause"] in set(bayes_names)]
+        assert tail == bayes_names
+
+    @pytest.mark.asyncio
+    async def test_candidate_scores_descending_within_bayesian(self) -> None:
+        """贝叶斯段分数降序"""
+        agent = RCAAgent()
+        alert = AlertEvent(
+            service="payment-service",
+            metric="p99_latency_ms",
+            value=2000.0,
+            threshold=500.0,
+            severity=SeverityLevel.CRITICAL,
+        )
+        result = await agent.process(
+            RCAInput(alert=alert, incident_id="inc-cand-order"),
+            AgentExecutionContext(incident_id="inc-cand-order", input_data={}),
+        )
+        candidates = result.output_data["rca_event"]["candidate_causes"]
+        bayes_names = {
+            c["cause"]
+            for c in result.output_data["rca_event"]["evidence"]["bayesian_top_causes"]
+        }
+        bayes_scores = [c["score"] for c in candidates if c["cause"] in bayes_names]
+        assert bayes_scores == sorted(bayes_scores, reverse=True)

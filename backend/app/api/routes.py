@@ -728,6 +728,7 @@ async def _process_incident_pipeline(incident: Incident) -> None:
                 incident.context["rca_confidence"] = rca_result.output_data.get("confidence", 0)
                 incident.context["rca_impact_count"] = rca_result.output_data.get("impact_services_count", 0)
                 incident.context["rca_suggested_actions"] = rca_result.output_data.get("suggested_actions", [])
+                incident.context["rca_candidate_causes"] = rca_event.candidate_causes
 
         if rca_event is None:
             await _escalate_pipeline_failure(
@@ -1045,6 +1046,7 @@ def _incident_to_dict(incident: Incident) -> dict[str, Any]:
             "confidence": incident.rca_event.confidence,
             "impact_chain": incident.rca_event.impact_chain,
             "suggested_actions": incident.rca_event.recommended_actions,
+            "candidate_causes": incident.rca_event.candidate_causes,
         }
     elif "rca_root_cause" in incident.context:
         data["rca"] = {
@@ -1052,6 +1054,7 @@ def _incident_to_dict(incident: Incident) -> dict[str, Any]:
             "confidence": incident.context.get("rca_confidence", 0),
             "impact_chain": [],
             "suggested_actions": incident.context.get("rca_suggested_actions", []),
+            "candidate_causes": incident.context.get("rca_candidate_causes", []),
         }
 
     # 提取 Heal 数据
