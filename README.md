@@ -14,6 +14,20 @@
 | 输出是什么 | 故障状态机全程流转记录（WebSocket 实时推送）：根因假设与置信度、Dry-Run 恢复计划、风险评分与审批结论、归档到记忆系统的诊断经验 |
 | 边界在哪 | 受控模拟原型：不触碰真实基础设施、不执行真实修复；LLM 是可选增强，默认走纯规则路径 |
 
+## 一键面试演示
+
+Docker 已启动时，在仓库根目录执行：
+
+```bash
+./scripts/demo.sh
+```
+
+脚本会启动或复用本地服务，注入 CPU 异常，等待多 Agent 管道，完成风险审批闭环并运行一次带显式合成真值的 reasoning Candidate Evaluation。首次构建后，面试现场建议使用 `./scripts/demo.sh --no-build`。
+
+- [5 分钟演示 Runbook](docs/demo-runbook.md)：逐分钟话术、页面顺序和故障预案；
+- [架构讲解稿](docs/architecture-walkthrough.md)：执行链路、设计取舍和常见追问；
+- [简历项目描述](docs/resume-project-description.md)：后端/SRE、AI Agent、精简版和英文版。
+
 ## 一个开关、两种执行引擎
 
 `POST /api/v1/incidents/trigger` 的后台处理引擎由环境变量 `APP_PIPELINE_ENGINE` 决定（`/ready` 的 `checks.langgraph.engine` 会如实报告当前配置）：
@@ -176,13 +190,25 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 
 [`eval_agent.py`](backend/app/agents/eval_agent.py) 实现了四维度（端到端 / 推理 / 工具调用 / RAG）评测框架，指标包括根因准确率、置信度校准、检索精确率等，并支持可选的 LLM-as-Judge 对推理链做融合评分（可配置独立 `judge_model` 防同源偏置）。评测通过独立的 `POST /api/v1/evaluations/run` 端点手动触发，不是 Incident Pipeline 的自动下游步骤。
 
-定位说明：这是 **Candidate Evaluation（候选评测）**——对真实跑过的 incident 产物按内置模拟场景真值配对计算的候选指标（无真值/无产物的维度按 `score_coverage` 如实置 N/A），用于演示评测方法论，不是 Accepted Baseline，不构成对系统真实效果的验收结论。
+定位说明：这是 **Candidate Evaluation（候选评测）**——对真实跑过的 incident 产物按内置模拟场景真值配对计算的候选指标（无真值/无产物的维度按 `score_coverage` 如实置 N/A），用于演示评测方法论，不构成对系统真实效果的验收结论。
+
+### Accepted Baseline v1（已入库）
+
+仓库另入库了一份 **Accepted Baseline v1**（[`backend/app/evaluation/baseline/accepted/v1/`](backend/app/evaluation/baseline/accepted/v1/)）：纯规则路径（LLM 三开关全关）、记忆隔离、11 条带告警指标的内置故障场景（4 条业务信号场景如实排除）、reasoning 维度规则指标；由生成脚本双跑一致性校验后落库，守护测试保证可复现与数据集不漂移：
+
+```bash
+cd backend
+python -m scripts.generate_accepted_baseline   # 重新生成（已存在需 --force）
+pytest tests/test_accepted_baseline.py -q      # 守护:可复现 + 数据集哈希一致
+```
+
+基线数字如实入库、未做挑选（根因 Top-1 为闭集通用根因与场景具体真值的精确串匹配，命名粒度失配会显著压低该值，明细与口径见 [`report.md`](backend/app/evaluation/baseline/accepted/v1/report.md)）。它是仓库代码在合成场景上的**确定性参照点**，仍不构成对真实生产效果的结论；`evaluated_git_sha` 指被评测代码的提交，非基线文件入库提交。
 
 ## 测试验证证据
 
 ```text
 Full-suite verification (2026-07-15, API 契约与质量门禁修复轮之后):
-409 passed / 1 skipped / 0 failed
+434 passed / 1 skipped / 0 failed
 Backend Docker image build: passed
 Runtime data module import: passed
 Frontend ESLint / production build: passed
@@ -195,6 +221,7 @@ Backend Ruff / Docker Compose config: passed
 
 ```text
 aiops-agent-platform/
+├── scripts/demo.sh          # 一键面试演示：启动、故障、审批、评测
 ├── backend/
 │   ├── app/
 │   │   ├── agents/          # Monitor / RCA / Heal / Change / Eval / Orchestrator

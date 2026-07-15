@@ -1487,20 +1487,9 @@ async def run_evaluation(
         explicit_truths = {}
     scenarios_by_id = {scenario["id"]: scenario for scenario in FAULT_SCENARIOS}
 
-    def normalize_ground_truth(raw: dict[str, Any]) -> dict[str, Any]:
-        """把请求体/数据集的场景真值归一为 reasoning ground_truth。"""
-        truth = dict(raw)
-        expected_action = raw.get("expected_action", {})
-        if "suggested_actions" not in truth:
-            if isinstance(expected_action, dict) and expected_action.get("type"):
-                truth["suggested_actions"] = [expected_action["type"]]
-            elif isinstance(expected_action, str) and expected_action:
-                truth["suggested_actions"] = [expected_action]
-        # FAULT_SCENARIOS 没有单独 evidence 字段；metrics 是场景已知的
-        # 观测真值，只映射为 evidence_completeness 所比较的证据类型。
-        if "evidence" not in truth and raw.get("metrics"):
-            truth["evidence"] = {"alert_metric": raw["metrics"]}
-        return truth
+    # 真值归一与基线脚本共用同一实现(evaluation/ground_truth.py),
+    # 保证端点数字与入库基线可互相对照
+    from app.evaluation.ground_truth import normalize_ground_truth
 
     # 从现有故障重建 rca_agent 产物，同时按 incident 粒度配对真值。
     # 优先级：显式请求体 > context.scenario_id > incident_id > N/A。
