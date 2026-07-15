@@ -559,3 +559,66 @@ def test_run_evaluation_reports_latency_and_cost(monkeypatch: pytest.MonkeyPatch
     coverage = report["score_coverage"]
     assert coverage["cost"]["status"] == "not_applicable"
     assert coverage["latency"]["status"] == "not_run"
+
+
+class TestIncidentToTestCaseHonesty:
+    """Codex 阻塞项 3 回归:escalated/automated/时长三处口径"""
+
+    @staticmethod
+    def _incident_with_timeline(
+        state: "IncidentState", seconds: int = 1000
+    ) -> Incident:
+        from datetime import datetime, timedelta, timezone
+
+        from app.models.incident import IncidentState, TimelineEntry
+
+        base = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+        incident = make_incident("inc-honesty", "memory_leak")
+        incident.timeline = [
+            TimelineEntry(timestamp=base, state=IncidentState.NEW),
+            TimelineEntry(
+                timestamp=base + timedelta(seconds=seconds), state=state
+            ),
+        ]
+        incident.state = state
+        return incident
+
+    def test_escalated_incident_marked_escalated(self) -> None:
+        from app.models.incident import IncidentState
+
+        incident = self._incident_with_timeline(IncidentState.ESCALATED)
+        case = EvalAgent._incident_to_test_case(incident, {})
+        assert case["actual_result"]["escalated"] is True
+        assert case["actual_result"]["resolved"] is False
+
+    def test_human_approved_resolution_not_automated(self) -> None:
+        from app.models.events import ApprovalStatus, ChangeEvent
+        from app.models.incident import IncidentState
+
+        incident = self._incident_with_timeline(IncidentState.RESOLVED)
+        incident.change_events.append(
+            ChangeEvent(
+                incident_id=incident.incident_id,
+                approval_status=ApprovalStatus.APPROVED,  # 人工批准
+            )
+        )
+        case = EvalAgent._incident_to_test_case(incident, {})
+        assert case["actual_result"]["automated"] is False
+
+        # 对照:自动批准的解决算自动化
+        incident.change_events[0].approval_status = ApprovalStatus.AUTO_APPROVED
+        case = EvalAgent._incident_to_test_case(incident, {})
+        assert case["actual_result"]["automated"] is True
+
+    def test_time_from_timeline_not_dead_metrics_field(self) -> None:
+        """1000 秒的真实时间线不得重建成 0 秒(死字段恒 0 会骗到满分时间分)"""
+        from app.models.incident import IncidentState
+
+        incident = self._incident_with_timeline(IncidentState.RESOLVED, seconds=1000)
+        case = EvalAgent._incident_to_test_case(incident, {})
+        assert case["actual_result"]["time_to_resolve_seconds"] == 1000.0
+
+        # 时间线不可测 → None(而非伪装成 0 秒)
+        incident.timeline = []
+        case = EvalAgent._incident_to_test_case(incident, {})
+        assert case["actual_result"]["time_to_resolve_seconds"] is None

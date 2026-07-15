@@ -291,7 +291,8 @@ class EndToEndEvaluator:
                         actual.get("action")
                         and actual.get("action") == expected.get("action")
                     ),
-                    "processing_time": actual.get("time_to_resolve_seconds", 0),
+                    # None=未实测(timeline 不可测),不得伪装成 0 秒
+                    "processing_time": actual.get("time_to_resolve_seconds"),
                     "detection_correct": (
                         actual.get("is_anomaly", False)
                         == sample.get("is_anomaly", False)
@@ -416,38 +417,49 @@ class EndToEndEvaluator:
         Returns:
             list[MetricScore]: 指标得分列表
         """
-        if not batch_results:
+        # 错误样本(缺 actual_result 等)只记录不进任何分母——
+        # 此前除以全量会让缺失结果伪装成"未升级/未误报"贡献正分
+        valid_results = [r for r in batch_results if "error" not in r]
+        if not valid_results:
             return []
 
         # 任务成功率
-        tsr = task_success_rate(batch_results)
+        tsr = task_success_rate(valid_results)
         rca_accuracy = sum(
-            1 for r in batch_results if r.get("root_cause_match", False)
-        ) / len(batch_results)
+            1 for r in valid_results if r.get("root_cause_match", False)
+        ) / len(valid_results)
         action_accuracy = sum(
-            1 for r in batch_results if r.get("action_match", False)
-        ) / len(batch_results)
-        automation = automation_rate(batch_results)
-        escalation = escalation_rate(batch_results)
+            1 for r in valid_results if r.get("action_match", False)
+        ) / len(valid_results)
+        automation = automation_rate(valid_results)
+        escalation = escalation_rate(valid_results)
         detection = sum(
-            1 for r in batch_results if r.get("detection_correct", False)
-        ) / len(batch_results)
+            1 for r in valid_results if r.get("detection_correct", False)
+        ) / len(valid_results)
 
-        # 处理时间分数
+        # 处理时间分数:只对真实测得的正时长计分;无任何实测时长时
+        # 不得回退 _compute_time_score(0)=1.0 的满分,如实给 0
         processing_times = [
-            r.get("processing_time", 0)
-            for r in batch_results
-            if r.get("processing_time", 0) > 0
+            r["processing_time"]
+            for r in valid_results
+            if isinstance(r.get("processing_time"), (int, float))
+            and r["processing_time"] > 0
         ]
         avg_time = float(np.mean(processing_times)) if processing_times else 0.0
-        time_score = self._compute_time_score(avg_time)
+        time_score = (
+            self._compute_time_score(avg_time) if processing_times else 0.0
+        )
 
         return [
             MetricScore(
                 metric_name="task_success_rate",
                 score=tsr,
                 weight=0.25,
-                details={"description": "任务成功率", "sample_count": len(batch_results)},
+                details={
+                    "description": "任务成功率",
+                    "sample_count": len(valid_results),
+                    "error_samples_excluded": len(batch_results) - len(valid_results),
+                },
             ),
             MetricScore(
                 metric_name="rca_accuracy",
@@ -483,6 +495,7 @@ class EndToEndEvaluator:
                 details={
                     "description": "处理时间得分",
                     "avg_processing_time_seconds": round(avg_time, 2),
+                    "measured_samples": len(processing_times),
                 },
             ),
             MetricScore(

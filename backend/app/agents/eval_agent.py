@@ -1730,7 +1730,25 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
     def _incident_to_test_case(
         incident: Incident, expected_result: dict[str, Any]
     ) -> dict[str, Any]:
-        """将故障实例转换为测试用例"""
+        """将故障实例转换为测试用例。
+
+        口径说明(Codex 审查修正):
+        - escalated 显式给出,否则 ESCALATED 事故会被框架层当"未升级";
+        - automated 要求"已解决且无人工批准的变更"——人工审批后解决
+          不算自动化(APPROVED=人工批准,AUTO_APPROVED=自动批准);
+        - 时长从 timeline 状态转移差分(IncidentMetrics.time_to_* 全库
+          无写入点,恒 0 会骗到满分时间分);不可测时为 None,不给 0。
+        """
+        from app.models.events import ApprovalStatus
+
+        latency_sample = EvalAgent._timeline_to_latency_sample(incident)
+        time_to_resolve = (
+            latency_sample.get("end_to_end_seconds") if latency_sample else None
+        )
+        human_approved = any(
+            ce.approval_status == ApprovalStatus.APPROVED
+            for ce in incident.change_events
+        )
         return {
             "id": incident.incident_id,
             "name": incident.title,
@@ -1739,10 +1757,9 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             "actual_result": {
                 "resolved": incident.is_resolved,
                 "is_anomaly": incident.state not in (IncidentState.CANCELLED,),
-                "time_to_resolve_seconds": incident.metrics.total_handling_time_seconds
-                if incident.metrics
-                else 0,
+                "time_to_resolve_seconds": time_to_resolve,
                 "state": incident.state.value if incident.state else "",
+                "escalated": incident.state == IncidentState.ESCALATED,
                 "root_cause": (
                     incident.rca_event.root_cause if incident.rca_event else ""
                 ),
@@ -1752,7 +1769,8 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
                     else ""
                 ),
                 "automated": incident.state
-                in (IncidentState.RESOLVED, IncidentState.CLOSED),
+                in (IncidentState.RESOLVED, IncidentState.CLOSED)
+                and not human_approved,
             },
         }
 

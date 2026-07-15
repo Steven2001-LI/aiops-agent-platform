@@ -545,3 +545,77 @@ class TestSendToLangfuse:
 
         framework = EvaluationFramework()
         assert await framework.send_to_langfuse(self._make_result()) is False
+
+
+class TestBatchDenominatorHonesty:
+    """Codex 阻塞项 4 回归:错误样本不进分母,无实测时长不给满分"""
+
+    @pytest.fixture
+    def evaluator(self) -> EndToEndEvaluator:
+        return EndToEndEvaluator()
+
+    @pytest.mark.asyncio
+    async def test_error_samples_excluded_from_denominators(
+        self, evaluator: EndToEndEvaluator
+    ) -> None:
+        """1 个有效 + 1 个缺 actual_result:分母为 1,不被错误样本稀释/美化"""
+        samples = [
+            {
+                "id": "ok",
+                "is_anomaly": True,
+                "actual_result": {
+                    "resolved": True,
+                    "is_anomaly": True,
+                    "escalated": True,
+                    "root_cause": "memory_leak",
+                    "action": "restart_pod",
+                    "time_to_resolve_seconds": 60,
+                },
+                "expected_result": {"root_cause": "memory_leak", "action": "restart_pod"},
+            },
+            {"id": "broken", "expected_result": {"root_cause": "memory_leak"}},
+        ]
+        result = await evaluator.evaluate(samples=samples)
+        assert result.status == EvaluationStatus.COMPLETED
+        scores = {m.metric_name: m for m in result.metric_scores}
+        # 有效样本升级了 → 低升级率得分应为 0,错误样本不得拉高
+        assert scores["escalation_rate"].score == 0.0
+        assert scores["rca_accuracy"].score == 1.0
+        assert scores["task_success_rate"].details["sample_count"] == 1
+        assert scores["task_success_rate"].details["error_samples_excluded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_all_error_samples_yield_no_scores(
+        self, evaluator: EndToEndEvaluator
+    ) -> None:
+        """全部样本缺 actual_result → 无任何指标得分,总分 0"""
+        result = await evaluator.evaluate(
+            samples=[{"id": "b1"}, {"id": "b2", "expected_result": {}}]
+        )
+        assert result.metric_scores == []
+        assert result.overall_score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_missing_processing_time_not_full_marks(
+        self, evaluator: EndToEndEvaluator
+    ) -> None:
+        """time_to_resolve_seconds 为 None/缺失时,时间分为 0 而非满分"""
+        samples = [
+            {
+                "id": "no-time",
+                "is_anomaly": True,
+                "actual_result": {
+                    "resolved": True,
+                    "is_anomaly": True,
+                    "escalated": False,
+                    "root_cause": "memory_leak",
+                    "action": "restart_pod",
+                    "time_to_resolve_seconds": None,
+                },
+                "expected_result": {"root_cause": "memory_leak", "action": "restart_pod"},
+            }
+        ]
+        result = await evaluator.evaluate(samples=samples)
+        scores = {m.metric_name: m for m in result.metric_scores}
+        assert scores["handling_time_score"].score == 0.0
+        assert scores["handling_time_score"].details["measured_samples"] == 0
