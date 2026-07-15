@@ -169,8 +169,8 @@ LLM 是**可选增强能力**，默认关闭，系统在纯规则模式下即可
 ## 测试验证证据
 
 ```text
-Clean-clone verification:
-345 passed / 1 skipped / 0 failed
+Full-suite verification (2026-07-15, 全景地图问题修复轮之后):
+402 passed / 1 skipped / 0 failed
 Backend Docker image build: passed
 Runtime data module import: passed
 ```
