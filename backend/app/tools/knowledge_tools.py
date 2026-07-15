@@ -56,7 +56,10 @@ class QueryKnowledgeBaseTool(BaseTool):
             ),
             ToolParameter(
                 name="category",
-                description="知识类别(fault_resolution/playbook/best_practice)",
+                description=(
+                    "知识类别，对应 KNOWLEDGE_BASE 条目的 category 字段"
+                    "(如 deployment_issue/resource_exhaustion/dependency_failure)"
+                ),
                 type="string",
                 required=False,
                 default="",
@@ -71,7 +74,6 @@ class QueryKnowledgeBaseTool(BaseTool):
 
         logger.info("Querying knowledge base", query=query, category=category)
 
-        query_lower = str(query).lower()
         # 先尝试 ChromaDB 向量检索
         try:
             from app.memory.storage import ChromaDBStorage
@@ -92,19 +94,38 @@ class QueryKnowledgeBaseTool(BaseTool):
             logger.debug("ChromaDB search unavailable, using keyword fallback", error=str(e))
 
         # Fallback: 在内存 KNOWLEDGE_BASE 中做关键词匹配
+        # 条目键为 category/symptoms/root_causes/solutions(snake_case 词表),
+        # 统一把下划线归一为空格后再匹配,使 "high cpu" 和 "high_cpu" 均可命中
+        def _normalize(text: str) -> str:
+            return text.lower().replace("_", " ")
+
+        query_norm = _normalize(str(query))
         matched = []
         for entry in KNOWLEDGE_BASE:
-            content = str(entry.get("content", "")).lower()
-            tags = " ".join(entry.get("tags", [])).lower()
+            if category and entry.get("category") != category:
+                continue
+            symptoms_norm = _normalize(" ".join(entry.get("symptoms", [])))
+            searchable = _normalize(
+                " ".join(
+                    [
+                        str(entry.get("category", "")),
+                        " ".join(entry.get("symptoms", [])),
+                        " ".join(entry.get("root_causes", [])),
+                        " ".join(entry.get("solutions", [])),
+                    ]
+                )
+            )
             score = 0.0
-            if query_lower in content:
+            if query_norm and query_norm in searchable:
                 score += 0.5
-            for word in query_lower.split():
-                if word in content:
+            for word in query_norm.split():
+                if word in searchable:
                     score += 0.1
-                if word in tags:
+                if word in symptoms_norm:
                     score += 0.2
             if score > 0:
+                # 与 RCAAgent._calculate_kb_match_score 一致:命中后叠加条目置信度加成
+                score = min(score + float(entry.get("confidence_boost", 0.0)), 1.0)
                 e_copy = dict(entry)
                 e_copy["score"] = score
                 matched.append(e_copy)
