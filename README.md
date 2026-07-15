@@ -207,15 +207,21 @@ pytest tests/test_accepted_baseline.py -q      # 守护:可复现 + 数据集哈
 ## 测试验证证据
 
 ```text
-Full-suite verification (2026-07-15, API 契约与质量门禁修复轮之后):
+Full-suite verification (2026-07-15, API 契约与质量门禁修复轮之后, 干净克隆):
 434 passed / 1 skipped / 0 failed
 Backend Docker image build: passed
 Runtime data module import: passed
 Frontend ESLint / production build: passed
 Backend Ruff / Docker Compose config: passed
+
+Full-suite verification (2026-07-16, 全景地图遗留问题修复轮之后, 工作副本实测):
+454 passed / 1 skipped / 0 failed
+Backend Ruff (app + scripts): passed
+Frontend production build: passed
+Accepted Baseline v1 guard tests: passed
 ```
 
-以上为在该次验证日期由当前依赖约束解析出的环境中完成的一次干净克隆验证，用于证明仓库自洽可构建、测试套件全绿；不代表生产 SLA 或线上质量承诺。
+以上干净克隆验证为在该次验证日期由当前依赖约束解析出的环境中完成，用于证明仓库自洽可构建、测试套件全绿；工作副本实测标注的是修复轮完成时的当前副本数字，非干净克隆。二者均不代表生产 SLA 或线上质量承诺。
 
 ## 项目结构
 
