@@ -16,7 +16,7 @@ AIOps Agent Platform - Evaluation Framework Core
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -31,7 +31,6 @@ from app.models.evaluation import (
     EvaluationResult,
     EvaluationStatus,
     EvaluationType,
-    MetricScore,
 )
 from app.utils.logging import get_logger
 

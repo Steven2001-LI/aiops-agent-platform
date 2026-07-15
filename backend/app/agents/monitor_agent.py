@@ -15,14 +15,13 @@ from enum import Enum
 from typing import Any, Deque
 
 import numpy as np
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from sklearn.ensemble import IsolationForest as SklearnIsolationForest
 
 from app.agents.base import AgentResult, BaseAgent
 from app.models.agent import AgentExecutionContext
 from app.models.events import AlertEvent, SeverityLevel
 from app.utils.logging import get_logger
-from app.utils.time_series import TimeSeriesAnalyzer
 
 logger = get_logger(__name__)
 

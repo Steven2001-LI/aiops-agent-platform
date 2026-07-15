@@ -181,12 +181,12 @@ class QueryTopologyTool(BaseTool):
         """查询拓扑"""
         service = kwargs.get("service", "")
         direction = kwargs.get("direction", "both")
-        depth = kwargs.get("depth", 3)
 
         logger.info(
             "Querying topology",
             service=service,
             direction=direction,
+            depth=kwargs.get("depth", 3),
         )
 
         target = str(service) if service else None
@@ -253,7 +253,7 @@ class QueryChangeHistoryTool(BaseTool):
         """查询变更历史"""
         service = kwargs.get("service", "")
         time_range = kwargs.get("time_range", "24h")
-        change_type = kwargs.get("change_type", "")
+        change_type = str(kwargs.get("change_type", ""))
 
         logger.info(
             "Querying change history",
@@ -270,6 +270,8 @@ class QueryChangeHistoryTool(BaseTool):
         try:
             cutoff = kwargs.get("window_minutes") or 60
             results = [cr for cr in CHANGE_RECORDS if cr.get("service") == svc]
+            if change_type:
+                results = [cr for cr in results if cr.get("type") == change_type]
             return ToolResult.ok(
                 tool_name=self.name,
                 data={

@@ -15,7 +15,6 @@ AIOps Agent Platform - Tool Call Evaluation
 
 from __future__ import annotations
 
-import copy
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,12 +24,10 @@ from typing import Any
 import numpy as np
 
 from app.evaluation.metrics import (
-    parameter_accuracy,
     tool_call_efficiency,
     tool_call_sequence_correctness,
     tool_execution_success,
     tool_selection_accuracy,
-    weighted_average,
 )
 from app.models.evaluation import (
     EvaluationResult,

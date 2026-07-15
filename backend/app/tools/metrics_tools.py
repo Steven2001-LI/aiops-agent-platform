@@ -7,7 +7,6 @@ AIOps Agent Platform - Metrics Tools
 
 from __future__ import annotations
 
-import random
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -241,6 +240,7 @@ class DetectAnomaliesTool(BaseTool):
             "Detecting anomalies",
             data_points=len(metric_data),
             method=method,
+            threshold=threshold,
         )
 
         try:

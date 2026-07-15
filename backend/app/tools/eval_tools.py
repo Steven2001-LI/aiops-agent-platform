@@ -67,21 +67,29 @@ class EvaluateOutputTool(BaseTool):
         logger.info("Evaluating agent output", criteria=criteria)
 
         # 无 LLM 时的规则评分；如 LLM 可用则可升级（见 Phase 3 '已知遗留'）
+        keywords = [str(item) for item in (criteria or [])]
+        if expected_output:
+            keywords.extend(
+                word.strip(".,:;!?()[]{}")
+                for word in str(expected_output).split()
+                if len(word.strip(".,:;!?()[]{}")) >= 4
+            )
+        keywords = list(dict.fromkeys(keyword for keyword in keywords if keyword))
         score = 0.0
         if agent_output:
             text = str(agent_output)
             text_lower = text.lower()
             # 简单启发式：关键词匹配期望内容
-            for kw in criteria or []:
+            for kw in keywords:
                 if str(kw).lower() in text_lower:
-                    score += 1.0 / max(len(criteria), 1)
+                    score += 1.0 / max(len(keywords), 1)
             score = min(score, 1.0)
         return ToolResult.ok(
             tool_name=self.name,
             data={
                 "score": score,
                 "matched_keywords": [
-                    kw for kw in (criteria or [])
+                    kw for kw in keywords
                     if str(kw).lower() in str(agent_output).lower()
                 ],
                 "method": "rule_based_fallback",

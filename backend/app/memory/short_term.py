@@ -18,7 +18,7 @@ from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.memory.storage import BaseStorage, InMemoryStorage
+from app.memory.storage import InMemoryStorage
 from app.models.memory import MemoryEntry, MemoryLevel, MemoryQuery, MemoryQueryResult, MemoryType
 from app.utils.logging import get_logger
 
@@ -196,8 +196,6 @@ class ShortTermMemory:
         """清理所有过期记忆"""
         removed = 0
         async with self._lock:
-            now = datetime.now(timezone.utc)
-
             # 清理存储层中的过期条目
             expired_ids = [
                 mid

@@ -27,7 +27,6 @@ from app.evaluation.metrics import (
     impact_analysis_accuracy,
     reasoning_steps_quality,
     root_cause_accuracy,
-    weighted_average,
 )
 from app.models.evaluation import (
     EvaluationResult,
@@ -231,7 +230,6 @@ class ReasoningEvaluator:
             # 评估每个样本
             sample_results: list[dict[str, Any]] = []
             rca_scores: list[float] = []
-            calibration_errors: list[float] = []
             evidence_scores: list[float] = []
             impact_scores: list[float] = []
             chain_scores: list[float] = []

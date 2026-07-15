@@ -15,7 +15,6 @@ AIOps Agent Platform - Memory Agent
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from app.agents.base import AgentResult, BaseAgent
@@ -23,7 +22,6 @@ from app.memory.core import MemorySystem
 from app.models.agent import AgentExecutionContext
 from app.models.memory import (
     MemoryEntry,
-    MemoryLevel,
     MemoryQuery,
     MemoryType,
 )

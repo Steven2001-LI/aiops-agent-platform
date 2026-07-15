@@ -8,7 +8,6 @@ AIOps Agent Platform - Change Agent
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field

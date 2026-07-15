@@ -7,7 +7,7 @@ AIOps Agent Platform - Heal Agent
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -15,10 +15,9 @@ from pydantic import BaseModel, Field
 
 from app.agents.base import AgentResult, BaseAgent
 from app.data.knowledge_base import SERVICE_TOPOLOGY
-from app.data.playbooks import PLAYBOOKS
 from app.data.public_playbooks import get_all_playbooks
 from app.models.agent import AgentExecutionContext
-from app.models.events import HealEvent, RCAEvent, SeverityLevel
+from app.models.events import HealEvent, RCAEvent
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)

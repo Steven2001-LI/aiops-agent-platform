@@ -159,6 +159,8 @@ class ExecutePlaybookStepTool(BaseTool):
                 error_message=f"Step index {step_index} out of range",
             )
         step = steps[step_index]
+        if parameters:
+            step = {**step, "parameters": parameters}
         # dry_run=True 时仅生成命令不执行
         if dry_run:
             return ToolResult.ok(
@@ -615,7 +617,6 @@ class PlaybookTool(BaseTool):
             验证结果，包含是否安全、原因和建议
         """
         action_type = action.get("type", "")
-        target = action.get("target", "")
 
         # 安全动作白名单
         safe_actions = {
