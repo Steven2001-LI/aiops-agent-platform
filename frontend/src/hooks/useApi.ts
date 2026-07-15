@@ -125,7 +125,29 @@ export function useIncidents() {
     [post] // ✅ post is stable
   );
 
-  return { data, loading, error, listIncidents, getIncident, triggerIncident };
+  // 人工审批恢复接口:批准补跑模拟收尾(→resolved),拒绝转人工升级(→escalated)
+  const approveIncident = useCallback(
+    (id: string, approver = 'admin', comment = '') =>
+      post(`/incidents/${id}/approve`, { approver, comment }),
+    [post]
+  );
+
+  const rejectIncident = useCallback(
+    (id: string, approver = 'admin', comment = '') =>
+      post(`/incidents/${id}/reject`, { approver, comment }),
+    [post]
+  );
+
+  return {
+    data,
+    loading,
+    error,
+    listIncidents,
+    getIncident,
+    triggerIncident,
+    approveIncident,
+    rejectIncident,
+  };
 }
 
 export function useAgents() {

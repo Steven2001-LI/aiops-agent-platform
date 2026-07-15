@@ -22,11 +22,27 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 
+function mapApiIncident(item: Record<string, unknown>, fallbackId: string): Incident {
+  return {
+    id: (item.incident_id as string) || (item.id as string) || fallbackId,
+    service: (item.service as string) || '',
+    metric: (item.metric as string) || '',
+    severity: (item.severity as Incident['severity']) || 'medium',
+    status: (item.status as Incident['status']) || (item.state as Incident['status']) || 'pending',
+    alert: item.alert as Incident['alert'],
+    rca: item.rca as Incident['rca'],
+    heal: item.heal as Incident['heal'],
+    change: item.change as Incident['change'],
+    created_at: (item.created_at as string) || '',
+    updated_at: (item.updated_at as string) || '',
+  };
+}
+
 export function IncidentDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { incidents, updateIncident } = useAppStore();
-  const { getIncident, loading } = useIncidents();
+  const { getIncident, approveIncident, rejectIncident, loading } = useIncidents();
   const [apiIncident, setApiIncident] = useState<Incident | null>(null);
 
   // Try loading from API if not in store
@@ -36,20 +52,9 @@ export function IncidentDetailPage() {
       try {
         const result = await getIncident(id);
         if (result) {
-          const item = result as unknown as Record<string, unknown>;
-          setApiIncident({
-            id: (item.incident_id as string) || (item.id as string) || id,
-            service: (item.service as string) || '',
-            metric: (item.metric as string) || '',
-            severity: (item.severity as Incident['severity']) || 'medium',
-            status: (item.status as Incident['status']) || (item.state as Incident['status']) || 'pending',
-            alert: item.alert as Incident['alert'],
-            rca: item.rca as Incident['rca'],
-            heal: item.heal as Incident['heal'],
-            change: item.change as Incident['change'],
-            created_at: (item.created_at as string) || '',
-            updated_at: (item.updated_at as string) || '',
-          });
+          setApiIncident(
+            mapApiIncident(result as unknown as Record<string, unknown>, id)
+          );
         }
       } catch (_e) {
         // fallback to store
@@ -162,13 +167,31 @@ export function IncidentDetailPage() {
     });
   };
 
-  const handleApprove = () => {
+  const applyApprovalDecision = async (decision: 'approve' | 'reject') => {
+    // 真实闭环:调后端审批恢复接口,以后端返回的 incident 状态为准
+    // (approve → resolved,reject → escalated)
+    const call = decision === 'approve' ? approveIncident : rejectIncident;
+    try {
+      const result = await call(incident.id, 'admin', '');
+      if (result) {
+        const mapped = mapApiIncident(
+          result as unknown as Record<string, unknown>,
+          incident.id
+        );
+        setApiIncident(mapped);
+        updateIncident({ ...incident, ...mapped });
+        return;
+      }
+    } catch (_e) {
+      // 后端不可达/不认识该 incident 时走下方本地兜底
+    }
+    // 兜底:仅用于后端没有登记的纯前端演示数据,状态语义与后端对齐
     updateIncident({
       ...incident,
-      status: 'healing',
+      status: decision === 'approve' ? 'resolved' : 'escalated',
       change: {
         ...incident.change,
-        approval_status: 'approved',
+        approval_status: decision === 'approve' ? 'approved' : 'rejected',
         risk_score: incident.change?.risk_score ?? 50,
         approver: 'admin',
       },
@@ -176,18 +199,12 @@ export function IncidentDetailPage() {
     });
   };
 
+  const handleApprove = () => {
+    void applyApprovalDecision('approve');
+  };
+
   const handleReject = () => {
-    updateIncident({
-      ...incident,
-      status: 'failed',
-      change: {
-        ...incident.change,
-        approval_status: 'rejected',
-        risk_score: incident.change?.risk_score ?? 50,
-        approver: 'admin',
-      },
-      updated_at: new Date().toISOString(),
-    });
+    void applyApprovalDecision('reject');
   };
 
   return (
