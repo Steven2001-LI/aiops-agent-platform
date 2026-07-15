@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.memory.storage import BaseStorage, ChromaDBStorage, get_embedding
-from app.models.memory import MemoryEntry, MemoryLevel, MemoryQuery, MemoryQueryResult, MemoryType
+from app.models.memory import MemoryEntry, MemoryLevel, MemoryQuery, MemoryQueryResult
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -77,11 +77,37 @@ def time_decay_score(
     return entry.importance_score * decay_factor + access_boost
 
 
-def keyword_search_score(query: str, entry: MemoryEntry) -> float:
+def compute_idf(entries: list[MemoryEntry]) -> dict[str, float]:
     """
-    关键词搜索得分（BM25简化版）
+    对候选语料现算 IDF:idf(w) = log(1 + N / (1 + df(w)))
 
-    基于TF-IDF思想的简化关键词匹配。
+    分词粒度与 keyword_search_score 的 TF 路一致(content 小写空白
+    切分)。检索时按语义候选池局部计算——RRF 只消费名次,池内区分度
+    足够,且无需维护语料级统计的持久化与失效逻辑。
+    """
+    n = len(entries)
+    if n == 0:
+        return {}
+    df: dict[str, int] = {}
+    for entry in entries:
+        for word in set(entry.content.lower().split()):
+            df[word] = df.get(word, 0) + 1
+    return {word: math.log(1 + n / (1 + count)) for word, count in df.items()}
+
+
+def keyword_search_score(
+    query: str,
+    entry: MemoryEntry,
+    idf: dict[str, float] | None = None,
+) -> float:
+    """
+    关键词搜索得分(TF-IDF)
+
+    idf 为 None 时退回常数权重 2.0(向后兼容旧行为);传入
+    compute_idf 的结果后,泛词(候选池里到处出现)权重被压低、
+    稀有判别词(主机名/错误码等)权重升高。
+    局限如实说明:纯中文内容在空白分词下 TF 路恒为 0,中文查询
+    仍靠下方三处子串匹配兜底(既有行为,本函数不做中文分词)。
     """
     query_lower = query.lower()
     content_lower = entry.content.lower()
@@ -96,7 +122,7 @@ def keyword_search_score(query: str, entry: MemoryEntry) -> float:
     if query_lower in content_lower:
         score += 0.8
 
-    # 分词匹配（TF思想）
+    # 分词匹配（TF-IDF）
     content_words = content_lower.split()
     content_len = len(content_words)
     if content_len == 0:
@@ -106,8 +132,9 @@ def keyword_search_score(query: str, entry: MemoryEntry) -> float:
         word_count = content_words.count(word)
         # TF = 词频 / 文档长度
         tf = word_count / content_len
-        # IDF简化 = log(1 + 1/包含该词的文档比例) -- 这里简化为常数
-        score += tf * 2.0
+        # IDF = log(1 + N/(1+df));未提供语料统计时保持旧常数 2.0
+        weight = idf.get(word, 2.0) if idf is not None else 2.0
+        score += tf * weight
 
     # 标签匹配
     for tag in entry.tags:
@@ -365,9 +392,10 @@ class LongTermMemory:
                 if entry:
                     all_entries.append(entry)
 
-            # 3. 关键词排序
+            # 3. 关键词排序(IDF 按本次候选池现算,多词查询时稀有词优先)
+            idf = compute_idf(all_entries)
             keyword_ranking = [
-                (e.memory_id, keyword_search_score(query.query_text, e))
+                (e.memory_id, keyword_search_score(query.query_text, e, idf))
                 for e in all_entries
             ]
             keyword_ranking.sort(key=lambda x: x[1], reverse=True)

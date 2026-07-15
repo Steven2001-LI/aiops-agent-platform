@@ -11,7 +11,13 @@ import asyncio
 import pytest
 
 from app.memory.core import MemorySystem
-from app.memory.long_term import LongTermMemory, rrf_fusion, time_decay_score
+from app.memory.long_term import (
+    LongTermMemory,
+    compute_idf,
+    keyword_search_score,
+    rrf_fusion,
+    time_decay_score,
+)
 from app.memory.short_term import ShortTermMemory
 from app.memory.storage import InMemoryStorage
 from app.memory.working_memory import WorkingMemory
@@ -420,3 +426,70 @@ class TestMemorySystem:
     def teardown_method(self) -> None:
         """清理MemorySystem单例"""
         MemorySystem.reset_instance()
+
+
+class TestKeywordSearchIDF:
+    """关键词检索真 IDF:候选池现算文档频率,替代旧常数权重"""
+
+    @staticmethod
+    def _entry(content: str, tags: list[str] | None = None, summary: str = "") -> MemoryEntry:
+        return MemoryEntry(
+            content=content,
+            summary=summary,
+            memory_type=MemoryType.EPISODIC,
+            memory_level=MemoryLevel.LONG_TERM,
+            source_agent="test",
+            tags=tags or [],
+        )
+
+    def test_compute_idf_rare_word_weighs_more(self) -> None:
+        """df 越大 IDF 越小;单文档词 > 全池词;空语料返回空 dict"""
+        entries = [
+            self._entry("timeout error in mysql"),
+            self._entry("timeout error in redis"),
+            self._entry("timeout error in kafka"),
+        ]
+        idf = compute_idf(entries)
+        # 'timeout' 全池出现(df=3),'mysql' 仅 1 篇(df=1)
+        assert idf["mysql"] > idf["timeout"]
+        import math
+        assert idf["timeout"] == pytest.approx(math.log(1 + 3 / 4))
+        assert idf["mysql"] == pytest.approx(math.log(1 + 3 / 2))
+        assert compute_idf([]) == {}
+
+    def test_rare_word_hit_outranks_common_word_hit(self) -> None:
+        """同 TF 下稀有词命中应压过泛词命中;旧常数权重会打成平手"""
+        rare_hit = self._entry("mysql failure")      # 命中稀有词,tf=1/2
+        common_hit = self._entry("timeout failure")  # 命中泛词,tf=1/2
+        pool = [rare_hit, common_hit,
+                self._entry("timeout in redis"), self._entry("timeout in kafka")]
+        idf = compute_idf(pool)
+
+        query = "mysql timeout"  # 整句不是任何 content 的子串,隔离子串加分
+        score_rare = keyword_search_score(query, rare_hit, idf)
+        score_common = keyword_search_score(query, common_hit, idf)
+        assert score_rare > score_common
+        # 旧常数权重下两者无差别 —— 这正是常数 IDF 的缺陷
+        assert keyword_search_score(query, rare_hit) == pytest.approx(
+            keyword_search_score(query, common_hit)
+        )
+
+    def test_backward_compat_without_idf(self) -> None:
+        """idf=None 保持旧行为:tf * 2.0(查询取双词避开整句子串加分)"""
+        entry = self._entry("mysql down")
+        # 'mysql redis' 整句不在 content 内 → 无 0.8 子串分;
+        # tf(mysql)=1/2 × 常数 2.0 = 1.0,redis 不命中
+        assert keyword_search_score("mysql redis", entry, None) == pytest.approx(1.0)
+        assert keyword_search_score("mysql redis", entry) == pytest.approx(1.0)
+
+    def test_chinese_substring_paths_intact(self) -> None:
+        """纯中文查询仍靠子串路径得分(content 0.8 / tag 0.5 / summary 0.3)"""
+        entry = self._entry(
+            "数据库连接池耗尽导致订单服务超时",
+            tags=["数据库故障"],
+            summary="数据库连接池耗尽",
+        )
+        idf = compute_idf([entry])
+        score = keyword_search_score("数据库连接池耗尽", entry, idf)
+        # content 子串 0.8 + tag 无命中(查询词整体不在 tag 内则 0)+ summary 0.3
+        assert score >= 0.8
