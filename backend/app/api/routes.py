@@ -1532,6 +1532,34 @@ async def get_topology(
 # Memory Routes
 # =============================================================================
 
+def _parse_memory_type(memory_type: str | None) -> MemoryType | None:
+    """把查询参数解析为 MemoryType,非法值抛 400。"""
+    if not memory_type:
+        return None
+    try:
+        return MemoryType(memory_type)
+    except ValueError:
+        valid = "/".join(t.value for t in MemoryType)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid memory_type '{memory_type}', expected one of: {valid}",
+        )
+
+
+def _memory_entry_to_dict(entry: Any) -> dict[str, Any]:
+    """MemoryEntry → 端点响应结构(保留 key/value 等既有字段名兼容消费方)。"""
+    return {
+        "id": entry.memory_id,
+        "memory_id": entry.memory_id,
+        "key": entry.summary or entry.content[:50],
+        "value": entry.content,
+        "type": entry.memory_type.value,
+        "created_at": entry.created_at.isoformat(),
+        "importance": entry.importance_score,
+        "tags": entry.tags,
+    }
+
+
 @api_router.get(
     "/memory/search",
     response_model=dict[str, Any],
@@ -1542,103 +1570,52 @@ async def get_topology(
 async def search_memory(
     query: str = Query(..., description="搜索查询"),
     top_k: int = Query(10, ge=1, le=50, description="返回数量"),
-    memory_type: str | None = Query(None, description="记忆类型过滤"),
+    memory_type: str | None = Query(
+        None, description="记忆类型过滤(episodic/semantic/procedural/observation)"
+    ),
     incident_id: str | None = Query(None, description="关联故障ID"),
 ) -> dict[str, Any]:
-    """搜索记忆 — 关键词匹配知识库和预置记忆"""
+    """搜索记忆 — 接真实 MemorySystem(三层记忆 + ChromaDB/RRF 混合检索)
+
+    记忆系统不可用或检索异常时降级为空结果(HTTP 200),不再回退到假数据。
+    """
     logger.info("Memory search", query=query, top_k=top_k)
 
-    # 构建搜索库
-    memory_items: list[dict[str, Any]] = [
-        {
-            "id": "MEM-001",
-            "key": "db_pool_exhaustion_pattern",
-            "value": "数据库连接池耗尽的典型特征：活跃连接数持续上升、等待队列增长、P99延迟突增",
-            "type": "knowledge",
-            "created_at": "2026-06-20T00:00:00Z",
-            "importance": 0.95,
-            "tags": ["database", "connection_pool", "latency"],
-        },
-        {
-            "id": "MEM-002",
-            "key": "playbook_restart_db_proxy",
-            "value": '{"steps": ["检查当前连接数", "优雅关闭旧连接", "重启代理", "验证连接恢复"]}',
-            "type": "playbook",
-            "created_at": "2026-06-18T00:00:00Z",
-            "importance": 0.9,
-            "tags": ["playbook", "database"],
-        },
-        {
-            "id": "MEM-003",
-            "key": "incident_user_service_latency",
-            "value": "user-service延迟问题历史：2026-06-15 因Redis缓存穿透导致，解决方案为布隆过滤器+本地缓存",
-            "type": "incident",
-            "created_at": "2026-06-15T00:00:00Z",
-            "importance": 0.85,
-            "tags": ["user-service", "latency", "redis", "cache"],
-        },
-        {
-            "id": "MEM-004",
-            "key": "cpu_spike_rollback_pattern",
-            "value": "部署后CPU飙升通常由新代码中的低效算法引起，优先回滚部署并检查性能测试结果",
-            "type": "knowledge",
-            "created_at": "2026-06-22T00:00:00Z",
-            "importance": 0.88,
-            "tags": ["cpu", "deployment", "rollback"],
-        },
-        {
-            "id": "MEM-005",
-            "key": "network_partition_handling",
-            "value": "网络分区时优先启用熔断器和降级策略，防止级联故障扩散到整个集群",
-            "type": "knowledge",
-            "created_at": "2026-06-19T00:00:00Z",
-            "importance": 0.92,
-            "tags": ["network", "circuit_breaker", "degradation"],
-        },
-        {
-            "id": "MEM-006",
-            "key": "oom_kill_recovery",
-            "value": '{"immediate": "restart_pod", "short_term": "increase_memory_limit", "long_term": "fix_memory_leak"}',
-            "type": "playbook",
-            "created_at": "2026-06-21T00:00:00Z",
-            "importance": 0.93,
-            "tags": ["oom", "memory", "recovery"],
-        },
+    mt = _parse_memory_type(memory_type)
+    empty_response = {
+        "query": query,
+        "results": [],
+        "total": 0,
+        "search_time_ms": 0.0,
+    }
+
+    ms = await _get_memory_system()
+    if ms is None:
+        return empty_response
+
+    try:
+        result = await ms.search(
+            query_text=query,
+            top_k=top_k,
+            memory_type=mt,
+            incident_id=incident_id or "",
+        )
+    except Exception as e:
+        logger.warning("Memory search failed, returning empty result", error=str(e))
+        return empty_response
+
+    similarities = list(result.similarities)
+    similarities += [0.0] * max(0, len(result.results) - len(similarities))
+    results = [
+        {"entry": _memory_entry_to_dict(entry), "score": round(score, 4)}
+        for entry, score in zip(result.results, similarities)
     ]
-
-    # 简单关键词匹配评分
-    query_lower = query.lower()
-    scored: list[tuple[dict[str, Any], float]] = []
-
-    for item in memory_items:
-        score = 0.0
-        # 匹配 key
-        if query_lower in item["key"].lower():
-            score += 0.5
-        # 匹配 value
-        if query_lower in item["value"].lower():
-            score += 0.3
-        # 匹配 tags
-        for tag in item.get("tags", []):
-            if query_lower in tag.lower():
-                score += 0.15
-        # 匹配 type
-        if memory_type and item["type"] == memory_type:
-            score += 0.2
-        # 重要性加成
-        score += item.get("importance", 0.5) * 0.1
-
-        if score > 0.1:
-            scored.append((item, score))
-
-    scored.sort(key=lambda x: x[1], reverse=True)
-    results = [{"entry": s[0], "score": round(s[1], 4)} for s in scored[:top_k]]
 
     return {
         "query": query,
         "results": results,
-        "total": len(results),
-        "search_time_ms": 5,
+        "total": result.total_found,
+        "search_time_ms": round(result.query_time_ms, 2),
     }
 
 
@@ -1655,12 +1632,34 @@ async def store_memory(
     incident_id: str = "",
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    """存储记忆"""
-    memory_id = f"mem-{uuid.uuid4().hex[:8]}"
-    logger.info("Store memory", memory_type=memory_type, memory_id=memory_id)
+    """存储记忆 — 真实写入 MemorySystem(此前只返回假 ID,不落任何存储)"""
+    mt = _parse_memory_type(memory_type) or MemoryType.OBSERVATION
 
+    ms = await _get_memory_system()
+    if ms is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Memory system unavailable",
+        )
+
+    try:
+        entry = await ms.store(
+            content=content,
+            memory_type=mt,
+            source_agent="api",
+            source_incident_id=incident_id,
+            tags=tags or [],
+        )
+    except Exception as e:
+        logger.warning("Memory store failed", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Memory store failed",
+        )
+
+    logger.info("Store memory", memory_type=memory_type, memory_id=entry.memory_id)
     return {
-        "memory_id": memory_id,
+        "memory_id": entry.memory_id,
         "status": "stored",
         "content_length": len(content),
         "type": memory_type,

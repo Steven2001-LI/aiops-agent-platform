@@ -267,10 +267,18 @@ class TestEvaluationEndpoints:
 
 
 class TestMemoryEndpoints:
-    """记忆管理端点测试"""
+    """记忆管理端点测试
 
-    def test_search_memory(self) -> None:
+    端点已接真实 MemorySystem;这里注入同接口的 Fake(见
+    tests/test_memory_endpoints_real.py),避免真实单例的 asyncio.Lock
+    跨 TestClient 事件循环绑定。响应形状断言与历史版本保持一致。
+    """
+
+    def test_search_memory(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """测试记忆搜索"""
+        from tests.test_memory_endpoints_real import install_fake_memory_system
+
+        install_fake_memory_system(monkeypatch)
         client = TestClient(app)
         response = client.get("/api/v1/memory/search?query=cpu%20high&top_k=5")
 
@@ -280,8 +288,11 @@ class TestMemoryEndpoints:
         assert "results" in data
         assert data["query"] == "cpu high"
 
-    def test_store_memory(self) -> None:
+    def test_store_memory(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """测试存储记忆"""
+        from tests.test_memory_endpoints_real import install_fake_memory_system
+
+        install_fake_memory_system(monkeypatch)
         client = TestClient(app)
         response = client.post(
             "/api/v1/memory/store?content=CPU%20usage%20at%2095%25&memory_type=observation"
