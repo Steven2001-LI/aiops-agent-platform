@@ -357,6 +357,90 @@ CHANGE_RECORDS: list[dict[str, Any]] = [
 
 
 # ============================================================
+# 业务事件数据集 - BusinessMonitorAgent 规则引擎的数据源
+# ============================================================
+# 结构: {场景: {数据源: [事件记录]}}。"normal" 为不命中任何规则的日常记录;
+# fs_biz_007~010 为对应 FAULT_SCENARIOS 纯业务故障场景准备的异常记录。
+# 与 METRICS_DATASETS 的 normal/anomaly 分档同一思路。
+
+BUSINESS_EVENTS: dict[str, dict[str, list[dict[str, Any]]]] = {
+    "normal": {
+        "payment_transactions": [
+            {"user_id": "u_001", "order_id": "ord_1001", "amount": 99.00, "charged_at": "2026-07-01T10:00:00+00:00"},
+            {"user_id": "u_002", "order_id": "ord_1002", "amount": 59.00, "charged_at": "2026-07-01T10:05:00+00:00"},
+        ],
+        "orders": [
+            {"order_id": "ord_1001", "product_id": "sku_100", "quantity": 1, "status": "paid", "amount": 99.00, "updated_at": "2026-07-01T10:01:00+00:00"},
+            {"order_id": "ord_1002", "product_id": "sku_200", "quantity": 2, "status": "paid", "amount": 59.00, "updated_at": "2026-07-01T10:06:00+00:00"},
+        ],
+        "products": [
+            {"product_id": "sku_100", "stock": 50},
+            {"product_id": "sku_200", "stock": 30},
+        ],
+        "payments": [
+            {"order_id": "ord_1001", "status": "success", "amount": 99.00},
+            {"order_id": "ord_1002", "status": "success", "amount": 59.00},
+        ],
+        "coupon_usage": [
+            {"coupon_id": "cp_500", "user_id": "u_001", "used_at": "2026-07-01T09:58:00+00:00"},
+            {"coupon_id": "cp_501", "user_id": "u_002", "used_at": "2026-07-01T10:03:00+00:00"},
+        ],
+    },
+    # fs_biz_007: 支付回调重试导致同一 (user, order) 5 分钟内扣款 3 次
+    "fs_biz_007": {
+        "payment_transactions": [
+            {"user_id": "u_100", "order_id": "ord_2001", "amount": 199.00, "charged_at": "2026-07-02T09:00:00+00:00"},
+            {"user_id": "u_100", "order_id": "ord_2001", "amount": 199.00, "charged_at": "2026-07-02T09:01:10+00:00"},
+            {"user_id": "u_100", "order_id": "ord_2001", "amount": 199.00, "charged_at": "2026-07-02T09:02:30+00:00"},
+        ],
+    },
+    # fs_biz_008: 秒杀竞态,已付/处理中订单合计 10 件 > 实际库存 3 件
+    "fs_biz_008": {
+        "orders": [
+            {"order_id": f"ord_30{i:02d}", "product_id": "sku_flash", "quantity": 1, "status": "paid" if i % 2 == 0 else "processing", "amount": 39.00, "updated_at": "2026-07-03T12:00:00+00:00"}
+            for i in range(10)
+        ],
+        "products": [
+            {"product_id": "sku_flash", "stock": 3},
+        ],
+    },
+    # fs_biz_009: 优惠券分摊精度问题,订单金额与实付相差 0.02 元
+    "fs_biz_009": {
+        "orders": [
+            {"order_id": "ord_4001", "product_id": "sku_100", "quantity": 3, "status": "paid", "amount": 100.00, "updated_at": "2026-07-04T15:00:00+00:00"},
+        ],
+        "payments": [
+            {"order_id": "ord_4001", "status": "success", "amount": 99.98},
+        ],
+    },
+    # fs_biz_010: 支付网关已扣款成功,但订单状态仍未更新为已支付
+    "fs_biz_010": {
+        "payments": [
+            {"order_id": "ord_5001", "status": "success", "amount": 59.00},
+            {"order_id": "ord_5002", "status": "success", "amount": 89.00},
+        ],
+        "orders": [
+            {"order_id": "ord_5001", "product_id": "sku_200", "quantity": 1, "status": "pending_payment", "amount": 59.00, "updated_at": "2026-07-05T08:00:00+00:00"},
+            {"order_id": "ord_5002", "product_id": "sku_200", "quantity": 1, "status": "pending_payment", "amount": 89.00, "updated_at": "2026-07-05T08:02:00+00:00"},
+        ],
+    },
+}
+
+
+def get_business_events(scenario: str = "normal") -> dict[str, list[dict[str, Any]]]:
+    """
+    获取业务事件数据集
+
+    Args:
+        scenario: 场景ID(normal / fs_biz_007~010);未知场景回退 normal
+
+    Returns:
+        {数据源: [事件记录]} 字典
+    """
+    return BUSINESS_EVENTS.get(scenario, BUSINESS_EVENTS["normal"])
+
+
+# ============================================================
 # 数据集访问辅助函数
 # ============================================================
 

@@ -332,12 +332,11 @@ class BusinessMonitorAgent(BaseAgent[BusinessMetricInput, AlertEvent]):
         """
         执行单条规则检查。
 
-        在生产环境中，这里会查询真实数据库/日志/消息队列。
-        当前提供模拟实现，支持注入模拟数据。
+        数据来源优先级:调用方经 context["business_events"] 传入真实业务事件
+        ({数据源: [记录]}),否则回退到 context["scenario_id"] 对应的静态
+        业务事件数据集(data/datasets.py 的 BUSINESS_EVENTS,默认 normal)。
         """
-        # 真实业务规则检测（已无 mock 注入路径）
-        # 当前：matched = False 表示规则未命中；如需触发，调用方应提供真实业务事件数据
-        matched, confidence = self._simulate_check(rule, input_data)
+        matched, confidence = self._evaluate_rule(rule, input_data)
 
         return BusinessRuleCheckResult(
             rule_id=rule["id"],
@@ -355,19 +354,124 @@ class BusinessMonitorAgent(BaseAgent[BusinessMetricInput, AlertEvent]):
         )
 
     @staticmethod
-    def _simulate_check(
+    def _resolve_events(input_data: BusinessMetricInput) -> dict[str, Any]:
+        """解析本次检查可用的业务事件记录。"""
+        injected = input_data.context.get("business_events")
+        if isinstance(injected, dict) and injected:
+            return injected
+        from app.data.datasets import get_business_events
+        return get_business_events(str(input_data.context.get("scenario_id", "normal")))
+
+    @staticmethod
+    def _parse_ts(value: Any) -> datetime | None:
+        try:
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _evaluate_rule(
+        self,
         rule: dict[str, Any],
         input_data: BusinessMetricInput,
     ) -> tuple[bool, float]:
         """
-        规则检查占位实现（生产环境需对接业务数据库/日志/消息队列）。
+        按规则 ID 对业务事件记录执行确定性检查。
 
-        当前为简化实现：默认返回未命中（matched=False）。
-        未来对接真实数据源后，此方法将执行 rule.get("check_sql") 中的 SQL 查询
-        或调用对应的业务事件 stream 读取接口。
-
-        Phase 4 起不再响应任何外部注入以触发命中；如需触发由调用方传入真实业务事件数据。
+        返回 (是否命中, 置信度)。数据源缺失时返回未命中——
+        br_inventory_discrepancy(需 ES 对账)与 br_user_permission_error
+        (需 auth_logs)在静态数据集中无数据,自然落入该分支。
         """
+        events = self._resolve_events(input_data)
+        rule_id = rule["id"]
+
+        if rule_id == "br_duplicate_charge":
+            # 同一 (user_id, order_id) 在 5 分钟窗口内扣款 > 1 次
+            groups: dict[tuple[str, str], list[datetime | None]] = {}
+            for txn in events.get("payment_transactions", []):
+                key = (str(txn.get("user_id")), str(txn.get("order_id")))
+                groups.setdefault(key, []).append(self._parse_ts(txn.get("charged_at")))
+            for stamps in groups.values():
+                if len(stamps) <= 1:
+                    continue
+                known = [s for s in stamps if s is not None]
+                within_window = (
+                    len(known) < 2
+                    or (max(known) - min(known)).total_seconds() <= 300
+                )
+                if within_window:
+                    return True, min(1.0, 0.5 + 0.25 * (len(stamps) - 1))
+            return False, 0.0
+
+        if rule_id == "br_oversell":
+            # 已付/处理中订单合计数量 > 商品库存
+            sold: dict[str, int] = {}
+            for order in events.get("orders", []):
+                if order.get("status") in {"paid", "processing"}:
+                    pid = str(order.get("product_id"))
+                    sold[pid] = sold.get(pid, 0) + int(order.get("quantity", 0))
+            for product in events.get("products", []):
+                pid = str(product.get("product_id"))
+                stock = int(product.get("stock", 0))
+                if sold.get(pid, 0) > stock:
+                    over_ratio = (sold[pid] - stock) / max(stock, 1)
+                    return True, min(1.0, 0.6 + over_ratio * 0.2)
+            return False, 0.0
+
+        if rule_id == "br_amount_mismatch":
+            # 订单金额与成功支付金额不一致
+            order_amounts = {
+                str(o.get("order_id")): float(o.get("amount", 0.0))
+                for o in events.get("orders", [])
+            }
+            mismatched = [
+                p for p in events.get("payments", [])
+                if p.get("status") == "success"
+                and str(p.get("order_id")) in order_amounts
+                and abs(float(p.get("amount", 0.0)) - order_amounts[str(p.get("order_id"))]) > 0.001
+            ]
+            if mismatched:
+                return True, min(1.0, 0.7 + 0.1 * len(mismatched))
+            return False, 0.0
+
+        if rule_id == "br_coupon_abuse":
+            # 同一 coupon_id 被使用 > 1 次
+            usage_count: dict[str, int] = {}
+            for usage in events.get("coupon_usage", []):
+                cid = str(usage.get("coupon_id"))
+                usage_count[cid] = usage_count.get(cid, 0) + 1
+            worst = max(usage_count.values(), default=0)
+            if worst > 1:
+                return True, min(1.0, 0.5 + 0.25 * (worst - 1))
+            return False, 0.0
+
+        if rule_id == "br_order_stuck":
+            # processing 状态停留超过 30 分钟(相对本次检查时间)
+            now = input_data.timestamp
+            for order in events.get("orders", []):
+                if order.get("status") != "processing":
+                    continue
+                updated_at = self._parse_ts(order.get("updated_at"))
+                if updated_at is not None and (now - updated_at).total_seconds() > 1800:
+                    return True, 0.8
+            return False, 0.0
+
+        if rule_id == "br_payment_callback_loss":
+            # 支付成功但对应订单状态未更新为已支付
+            order_status = {
+                str(o.get("order_id")): o.get("status")
+                for o in events.get("orders", [])
+            }
+            lost = [
+                p for p in events.get("payments", [])
+                if p.get("status") == "success"
+                and order_status.get(str(p.get("order_id"))) not in (None, "paid")
+            ]
+            if lost:
+                return True, min(1.0, 0.7 + 0.1 * len(lost))
+            return False, 0.0
+
+        # 其余规则(库存双写对账/权限异常)所需数据源不在业务事件数据集中,
+        # 数据缺失时如实返回未命中,不伪造结论
         return False, 0.0
 
     # ==================== 告警生成 ====================
