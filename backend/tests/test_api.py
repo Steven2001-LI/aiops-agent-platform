@@ -240,6 +240,42 @@ class TestTopologyEndpoints:
         assert data["root_service"] == "order-service"
         assert data["depth"] == 2
 
+    def test_topology_node_metrics_from_dataset(self) -> None:
+        """节点指标可由静态数据集推导(此前用 hash 伪造,跨进程不稳定)。"""
+        from app.data.datasets import METRICS_DATASETS
+
+        client = TestClient(app)
+        data = client.get("/api/v1/topology").json()
+        by_id = {n["id"]: n for n in data["nodes"]}
+
+        order = by_id["order-service"]["metrics"]
+        expected_cpu = METRICS_DATASETS["order-service"]["cpu_usage_percent"]["normal"][-1]
+        expected_lat = METRICS_DATASETS["order-service"]["p99_latency_ms"]["normal"][-1]
+        assert order["cpu"] == f"{expected_cpu:.0f}%"
+        assert order["latency"] == f"{expected_lat:.0f}ms"
+
+        # 数据层节点不在数据集中,诚实返回 None 而非伪造数值
+        assert by_id["mysql-primary"]["metrics"] == {
+            "cpu": None,
+            "memory": None,
+            "latency": None,
+        }
+
+    def test_topology_metrics_deterministic(self) -> None:
+        """连续两次请求指标完全一致(防回归到随机/hash 数据源)。"""
+        client = TestClient(app)
+        first = client.get("/api/v1/topology").json()["nodes"]
+        second = client.get("/api/v1/topology").json()["nodes"]
+        assert first == second
+
+    def test_topology_bfs_nodes_have_metrics(self) -> None:
+        """BFS 补充的节点同样带 metrics 字段(此前缺失,与主列表不一致)。"""
+        client = TestClient(app)
+        data = client.get("/api/v1/topology?service=order-service&depth=2").json()
+        assert len(data["nodes"]) > 1
+        for node in data["nodes"]:
+            assert "metrics" in node, f"node {node['id']} missing metrics"
+
 
 class TestEvaluationEndpoints:
     """评估管理端点测试"""

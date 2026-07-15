@@ -1415,6 +1415,28 @@ async def run_evaluation(
 # Topology Routes
 # =============================================================================
 
+def _topology_node_metrics(svc_name: str) -> dict[str, Any]:
+    """节点指标取静态数据集 normal 场景的最新值。
+
+    数据层节点(mysql-primary/redis-cache/elasticsearch)不在 METRICS_DATASETS,
+    诚实返回 None 而非伪造数值。
+    """
+    if svc_name not in METRICS_DATASETS:
+        return {"cpu": None, "memory": None, "latency": None}
+    return {
+        "cpu": f"{get_metric_data(svc_name, 'cpu_usage_percent', 'normal')[-1]:.0f}%",
+        "memory": f"{get_metric_data(svc_name, 'memory_usage_percent', 'normal')[-1]:.0f}%",
+        "latency": f"{get_metric_data(svc_name, 'p99_latency_ms', 'normal')[-1]:.0f}ms",
+    }
+
+
+def _topology_edge_latency(target: str) -> str | None:
+    """边延迟取被调用方(target)的 p99 延迟最新值;无数据集时为 None。"""
+    if target not in METRICS_DATASETS:
+        return None
+    return f"{get_metric_data(target, 'p99_latency_ms', 'normal')[-1]:.0f}ms"
+
+
 @api_router.get(
     "/topology",
     response_model=dict[str, Any],
@@ -1459,11 +1481,7 @@ async def get_topology(
             "status": status_map.get(svc_name, "healthy"),
             "dependencies": svc_info.get("dependencies", []),
             "tier": svc_info.get("tier", "standard"),
-            "metrics": {
-                "cpu": f"{30 + hash(svc_name) % 50}%",
-                "memory": f"{40 + hash(svc_name + 'm') % 40}%",
-                "latency": f"{10 + hash(svc_name + 'l') % 100}ms",
-            },
+            "metrics": _topology_node_metrics(svc_name),
         })
 
     # 构建边列表
@@ -1482,7 +1500,7 @@ async def get_topology(
                     "source": svc_name,
                     "target": dep,
                     "type": edge_type,
-                    "latency": f"{5 + hash(edge_key) % 50}ms",
+                    "latency": _topology_edge_latency(dep),
                 })
         for dep in svc_info.get("dependents", []):
             edge_key = f"{dep}->{svc_name}"
@@ -1492,7 +1510,7 @@ async def get_topology(
                     "source": dep,
                     "target": svc_name,
                     "type": "http",
-                    "latency": f"{5 + hash(edge_key) % 50}ms",
+                    "latency": _topology_edge_latency(svc_name),
                 })
 
     # 如果指定了 service，执行 BFS 展开
@@ -1517,6 +1535,7 @@ async def get_topology(
                             "status": "healthy",
                             "dependencies": SERVICE_TOPOLOGY.get(dep, {}).get("dependencies", []),
                             "tier": SERVICE_TOPOLOGY.get(dep, {}).get("tier", "standard"),
+                            "metrics": _topology_node_metrics(dep),
                         })
 
     return {
