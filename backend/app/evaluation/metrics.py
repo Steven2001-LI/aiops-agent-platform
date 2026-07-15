@@ -16,7 +16,7 @@ AIOps Agent Platform - Comprehensive Evaluation Metrics Library
 
 from __future__ import annotations
 
-import math
+import os
 from typing import Any
 
 import numpy as np
@@ -614,23 +614,40 @@ def retrieval_recall(retrieved: list[str], relevant: list[str]) -> float:
     return intersection / len(relevant_set)
 
 
-def context_relevance(context: list[str], query: str) -> float:
-    """
-    评估上下文相关性
+# -----------------------------------------------------------------------------
+# RAG 语义指标基建:embedding 余弦为主路径,词面重叠为回退
+# -----------------------------------------------------------------------------
 
-    使用简单的关键词重叠来计算上下文与查询的相关性。
-    实际应用中应使用 Embedding 模型计算语义相似度。
 
-    Args:
-        context: 检索到的上下文文本列表
-        query: 查询文本
+def _semantic_enabled() -> bool:
+    """EVAL_RAG_SEMANTIC=0 时强制词面路径(测试/离线场景的确定性开关)。"""
+    return os.getenv("EVAL_RAG_SEMANTIC", "1") != "0"
 
-    Returns:
-        float: 上下文相关性分数 (0.0 - 1.0)
-    """
-    if not context or not query:
-        return 0.0
 
+def _encode(texts: list[str]) -> list[list[float]] | None:
+    """惰性调用记忆存储层的同步批量编码;语义能力不可用时返回 None。"""
+    if not _semantic_enabled():
+        return None
+    try:
+        from app.memory.storage import encode_texts_sync
+    except ImportError:
+        return None
+    return encode_texts_sync(texts)
+
+
+def _clamped_cosine(a: list[float], b: list[float]) -> float:
+    """向量已 L2 归一化,点积即余弦;截断进 [0,1]。"""
+    return max(0.0, min(1.0, float(np.dot(a, b))))
+
+
+def rag_metric_mode() -> str:
+    """当前 RAG 语义指标实际生效的模式(写进评测报告,防"以为在跑
+    语义实际在跑词面"的误读;语义分与词面分不可跨模式比较)。"""
+    return "semantic" if _encode(["probe"]) is not None else "lexical"
+
+
+def _lexical_context_relevance(context: list[str], query: str) -> float:
+    """词面回退:query 与各条 context 的 Jaccard 均值。"""
     query_words = set(query.lower().split())
     if not query_words:
         return 0.0
@@ -651,55 +668,24 @@ def context_relevance(context: list[str], query: str) -> float:
     return float(np.mean(relevance_scores)) if relevance_scores else 0.0
 
 
-def answer_faithfulness(answer: str, context: list[str]) -> float:
-    """
-    评估回答忠实度
-
-    检查回答中的内容是否能在上下文中找到依据。
-    使用关键词覆盖度作为代理指标。
-
-    Args:
-        answer: 生成的回答文本
-        context: 检索到的上下文文本列表
-
-    Returns:
-        float: 忠实度分数 (0.0 - 1.0)
-    """
-    if not answer or not context:
-        return 0.0
-
+def _lexical_answer_faithfulness(answer: str, context: list[str]) -> float:
+    """词面回退:answer 词汇在合并 context 中的覆盖度。"""
     answer_words = set(answer.lower().split())
     if not answer_words:
         return 0.0
 
-    # 合并所有上下文
     all_context = " ".join(context)
     context_words = set(all_context.lower().split())
 
     if not context_words:
         return 0.0
 
-    # 计算回答中词汇在上下文中的覆盖度
     covered = len(answer_words & context_words)
     return covered / len(answer_words)
 
 
-def answer_relevance(answer: str, query: str) -> float:
-    """
-    评估回答相关性
-
-    计算回答与查询之间的相关性。
-
-    Args:
-        answer: 生成的回答文本
-        query: 查询文本
-
-    Returns:
-        float: 相关性分数 (0.0 - 1.0)
-    """
-    if not answer or not query:
-        return 0.0
-
+def _lexical_answer_relevance(answer: str, query: str) -> float:
+    """词面回退:answer 与 query 词集的 Jaccard。"""
     answer_words = set(answer.lower().split())
     query_words = set(query.lower().split())
 
@@ -712,11 +698,99 @@ def answer_relevance(answer: str, query: str) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _lexical_context_sufficiency(context: list[str], query: str) -> float:
+    """词面回退:query 词汇在合并 context 中的覆盖度。"""
+    query_words = set(query.lower().split())
+    if not query_words:
+        return 0.0
+
+    all_context = " ".join(context)
+    context_words = set(all_context.lower().split())
+
+    if not context_words:
+        return 0.0
+
+    covered = len(query_words & context_words)
+    return covered / len(query_words)
+
+
+def context_relevance(context: list[str], query: str) -> float:
+    """
+    评估上下文相关性:query 与各条 context 的语义余弦均值
+
+    embedding 不可用(库缺失/加载失败/EVAL_RAG_SEMANTIC=0)时
+    回退词面 Jaccard 均值。
+
+    Args:
+        context: 检索到的上下文文本列表
+        query: 查询文本
+
+    Returns:
+        float: 上下文相关性分数 (0.0 - 1.0)
+    """
+    if not context or not query:
+        return 0.0
+
+    vectors = _encode([query, *context])
+    if vectors is None:
+        return _lexical_context_relevance(context, query)
+
+    query_vec, ctx_vecs = vectors[0], vectors[1:]
+    scores = [_clamped_cosine(query_vec, v) for v in ctx_vecs]
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def answer_faithfulness(answer: str, context: list[str]) -> float:
+    """
+    评估回答忠实度:answer 与最相近一条 context 的语义余弦
+
+    max-over-contexts 是最小实现(RAGAS 式分句聚合留作后续增强,
+    长答案的局部幻觉会被整段编码稀释);回退词面覆盖度。
+
+    Args:
+        answer: 生成的回答文本
+        context: 检索到的上下文文本列表
+
+    Returns:
+        float: 忠实度分数 (0.0 - 1.0)
+    """
+    if not answer or not context:
+        return 0.0
+
+    vectors = _encode([answer, *context])
+    if vectors is None:
+        return _lexical_answer_faithfulness(answer, context)
+
+    answer_vec, ctx_vecs = vectors[0], vectors[1:]
+    return max((_clamped_cosine(answer_vec, v) for v in ctx_vecs), default=0.0)
+
+
+def answer_relevance(answer: str, query: str) -> float:
+    """
+    评估回答相关性:answer 与 query 的语义余弦;回退词面 Jaccard
+
+    Args:
+        answer: 生成的回答文本
+        query: 查询文本
+
+    Returns:
+        float: 相关性分数 (0.0 - 1.0)
+    """
+    if not answer or not query:
+        return 0.0
+
+    vectors = _encode([answer, query])
+    if vectors is None:
+        return _lexical_answer_relevance(answer, query)
+
+    return _clamped_cosine(vectors[0], vectors[1])
+
+
 def context_sufficiency(context: list[str], query: str) -> float:
     """
-    评估上下文充分性
+    评估上下文充分性:最好的一条 context 对 query 的语义余弦(max)
 
-    检查检索到的上下文是否足以回答查询。
+    "检索结果里最相关的那条是否覆盖了查询";回退词面覆盖度。
 
     Args:
         context: 检索到的上下文文本列表
@@ -728,21 +802,12 @@ def context_sufficiency(context: list[str], query: str) -> float:
     if not context or not query:
         return 0.0
 
-    # 查询中的关键词
-    query_words = set(query.lower().split())
-    if not query_words:
-        return 0.0
+    vectors = _encode([query, *context])
+    if vectors is None:
+        return _lexical_context_sufficiency(context, query)
 
-    # 合并所有上下文
-    all_context = " ".join(context)
-    context_words = set(all_context.lower().split())
-
-    if not context_words:
-        return 0.0
-
-    # 查询关键词在上下文中的覆盖度
-    covered = len(query_words & context_words)
-    return covered / len(query_words)
+    query_vec, ctx_vecs = vectors[0], vectors[1:]
+    return max((_clamped_cosine(query_vec, v) for v in ctx_vecs), default=0.0)
 
 
 # =============================================================================

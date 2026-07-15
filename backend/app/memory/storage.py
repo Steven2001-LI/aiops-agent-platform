@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
@@ -64,11 +63,9 @@ async def get_embedding(text: str) -> list[float]:
         list[float]: 向量表示
     """
     try:
-        from sentence_transformers import SentenceTransformer
-
-        # 使用线程池避免阻塞事件循环
-        loop = asyncio.get_event_loop()
-        model = _get_sentence_transformer_model()
+        # 模型初始化和 encode 都可能较慢，不在事件循环线程中执行。
+        loop = asyncio.get_running_loop()
+        model = await loop.run_in_executor(None, _get_sentence_transformer_model)
         embedding = await loop.run_in_executor(None, model.encode, text)
         return embedding.tolist()
     except ImportError:
@@ -87,9 +84,35 @@ def _get_sentence_transformer_model() -> Any:
     """获取或初始化 SentenceTransformer 模型（单例）"""
     global _sentence_transformer_model
     if _sentence_transformer_model is None:
+        # 保持可选依赖语义：未安装时由 get_embedding 捕获 ImportError 并降级。
+        from sentence_transformers import SentenceTransformer
+
         _sentence_transformer_model = SentenceTransformer("all-MiniLM-L6-v2")
         logger.info("SentenceTransformer model loaded: all-MiniLM-L6-v2")
     return _sentence_transformer_model
+
+
+def encode_texts_sync(texts: list[str]) -> list[list[float]] | None:
+    """同步批量编码,返回 L2 归一化向量(评测等显式批处理场景用)。
+
+    sentence-transformers 不可用/加载失败时返回 None——调用方应回退
+    自己的词面实现。绝不能用 hash_based_embedding 兜底做相似度:
+    哈希向量对不同文本近正交(任意余弦≈0),会把语义指标系统性打崩。
+    """
+    if not texts:
+        return []
+    try:
+        model = _get_sentence_transformer_model()
+        vectors = model.encode(texts)
+    except Exception as e:
+        logger.warning(f"Sync text encoding unavailable: {e}")
+        return None
+    result: list[list[float]] = []
+    for vec in vectors:
+        values = vec.tolist()
+        norm = math.sqrt(sum(v * v for v in values))
+        result.append([v / norm for v in values] if norm > 0 else values)
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -148,6 +148,10 @@ class RAGMetrics(BaseModel):
     answer_faithfulness: float = Field(default=0.0, description="答案忠实度")
     answer_relevance: float = Field(default=0.0, description="回答相关性")
     mean_retrieval_score: float = Field(default=0.0, description="平均检索得分")
+    # 语义分与词面分不可跨模式比较,报告里必须标注实际生效模式
+    metric_mode: str = Field(
+        default="lexical", description="语义指标模式(semantic/lexical)"
+    )
 
 
 class EvalReport(BaseModel):
@@ -1000,6 +1004,8 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             else 0.0
         )
 
+        from app.evaluation.metrics import rag_metric_mode
+
         return RAGMetrics(
             retrieval_precision=round(avg_precision, 4),
             retrieval_recall=round(avg_recall, 4),
@@ -1017,6 +1023,7 @@ class EvalAgent(BaseAgent[EvalInput, EvalReport]):
             if answer_relevances
             else 0.0,
             mean_retrieval_score=round(float(np.mean(scores)), 4) if scores else 0.0,
+            metric_mode=rag_metric_mode(),
         )
 
     # ==================== 综合评分 ====================

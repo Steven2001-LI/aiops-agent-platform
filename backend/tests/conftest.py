@@ -26,6 +26,12 @@ sys.path.insert(0, str(_BACKEND_ROOT))
 import os
 os.environ["LANGFUSE_ENABLED"] = "false"
 
+# 测试确定性:RAG 语义指标固定走词面回退路径。语义路径依赖本机
+# HF 缓存的 sentence-transformers 模型(干净克隆/CI 首跑会触发下载,
+# 离线则回退),数值断言在语义模式下不可确定。语义路径由
+# tests/test_rag_semantic_metrics.py 用桩向量单独覆盖。
+os.environ.setdefault("EVAL_RAG_SEMANTIC", "0")
+
 
 # 测试隔离:SQLITE_PATH 逐用例指向独立临时库。
 # IncidentService 持久化与 eval_tools 都按调用时的 SQLITE_PATH 落盘,
