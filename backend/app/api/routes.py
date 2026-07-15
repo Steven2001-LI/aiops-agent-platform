@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel as PydanticBaseModel, Field
 
 from app.agents.base import AgentExecutionContext
@@ -98,6 +98,103 @@ def _get_business_monitor() -> BusinessMonitorAgent:
     if _business_monitor_agent is None:
         _business_monitor_agent = BusinessMonitorAgent()
     return _business_monitor_agent
+
+
+# =============================================================================
+# Agent 注册表（供 /agents 端点读取真实元数据与执行统计）
+# =============================================================================
+# peek 只读取已实例化的模块级单例,绝不触发惰性构造——
+# 避免 GET 列表引发重型初始化;未实例化的 Agent 诚实报告零统计。
+# memory/eval/orchestrator 没有常驻 BaseAgent 单例(eval 按评审白名单要求
+# 每次请求内构造),它们的统计恒为 0,状态由各自子系统可用性推导。
+_AGENT_REGISTRY: dict[str, dict[str, Any]] = {
+    "monitor-agent-001": {
+        "agent_type": AgentType.MONITOR,
+        "name": "Monitor Agent",
+        "description": "集成3-Sigma/EWMA/IsolationForest多算法投票的智能异常检测",
+        "capabilities": ["3-Sigma检测", "EWMA趋势分析", "Isolation Forest", "告警去重", "自适应阈值"],
+        "peek": lambda: _monitor_agent,
+    },
+    "rca-agent-001": {
+        "agent_type": AgentType.RCA,
+        "name": "RCA Agent",
+        "description": "基于贝叶斯推理+BFS依赖遍历+RAG知识库增强的根因分析引擎",
+        "capabilities": ["BFS拓扑遍历", "贝叶斯推理", "RAG知识库检索", "影响链路构建"],
+        "peek": lambda: _rca_agent,
+    },
+    "heal-agent-001": {
+        "agent_type": AgentType.HEAL,
+        "name": "Heal Agent",
+        "description": "Playbook驱动的故障自愈引擎，支持L0-L2三级自愈+熔断控制",
+        "capabilities": ["Playbook匹配", "Dry-Run模拟", "爆炸半径评估", "熔断保护", "回滚计划"],
+        "peek": lambda: _heal_agent,
+    },
+    "change-agent-001": {
+        "agent_type": AgentType.CHANGE,
+        "name": "Change Agent",
+        "description": "多维风险评分+多级审批流程的变更管理Agent",
+        "capabilities": ["五因素风险评分", "多级审批", "审计日志", "升级机制"],
+        "peek": lambda: _change_agent,
+    },
+    "memory-agent-001": {
+        "agent_type": AgentType.MEMORY,
+        "name": "Memory Agent",
+        "description": "三层记忆系统（短期/长期/工作记忆），支持语义搜索和时间衰减",
+        "capabilities": ["语义搜索", "RRF融合排序", "时间衰减", "记忆合并", "自动归档"],
+        "peek": lambda: None,
+    },
+    "eval-agent-001": {
+        "agent_type": AgentType.EVAL,
+        "name": "Eval Agent",
+        "description": "四维度（端到端/推理/工具调用/RAG）评估框架",
+        "capabilities": ["端到端评估", "推理评估", "工具调用评估", "RAG评估", "基准报告"],
+        "peek": lambda: None,
+    },
+    "orchestrator-001": {
+        "agent_type": AgentType.ORCHESTRATOR,
+        "name": "Orchestrator",
+        "description": "LangGraph多Agent编排器，管理完整故障处理状态机",
+        "capabilities": ["状态机编排", "条件路由", "审批暂停终态", "失败升级"],
+        "peek": lambda: None,
+    },
+}
+
+
+def _agent_public_info(agent_id: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """组装单个 Agent 的对外信息:已实例化的读真实 AgentState,否则零统计。"""
+    info: dict[str, Any] = {
+        "agent_id": agent_id,
+        "agent_type": meta["agent_type"].value,
+        "name": meta["name"],
+        "description": meta["description"],
+        "status": AgentStatus.IDLE.value,
+        "version": "1.0.0",
+        "capabilities": meta["capabilities"],
+        "total_executions": 0,
+        "successful_executions": 0,
+        "failed_executions": 0,
+        "success_rate": 0.0,
+        "average_execution_time_ms": 0.0,
+        "last_active_at": None,
+    }
+    instance = meta["peek"]()
+    if instance is not None:
+        state = instance.state
+        info.update(
+            {
+                "status": state.status.value,
+                "version": instance.get_version(),
+                "total_executions": state.total_executions,
+                "successful_executions": state.successful_executions,
+                "failed_executions": state.failed_executions,
+                "success_rate": round(state.success_rate, 4),
+                "average_execution_time_ms": round(state.average_execution_time_ms, 2),
+                "last_active_at": (
+                    state.last_active_at.isoformat() if state.last_active_at else None
+                ),
+            }
+        )
+    return info
 
 
 # =============================================================================
@@ -1012,77 +1109,24 @@ async def list_incidents(
     description="获取所有已注册 Agent 的列表和状态概览。",
 )
 async def list_agents(
+    request: Request,
     agent_type: AgentType | None = Query(None, description="按类型过滤"),
     status: AgentStatus | None = Query(None, description="按状态过滤"),
 ) -> dict[str, Any]:
-    """获取 Agent 列表（含实时统计信息）"""
+    """获取 Agent 列表（元数据 + 真实执行统计）"""
     logger.info("List agents requested")
 
     agents = [
-        {
-            "agent_id": "monitor-agent-001",
-            "agent_type": AgentType.MONITOR.value,
-            "name": "Monitor Agent",
-            "description": "集成3-Sigma/EWMA/IsolationForest多算法投票的智能异常检测",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["3-Sigma检测", "EWMA趋势分析", "Isolation Forest", "告警去重", "自适应阈值"],
-        },
-        {
-            "agent_id": "rca-agent-001",
-            "agent_type": AgentType.RCA.value,
-            "name": "RCA Agent",
-            "description": "基于贝叶斯推理+BFS依赖遍历+RAG知识库增强的根因分析引擎",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["BFS拓扑遍历", "贝叶斯推理", "RAG知识库检索", "影响链路构建"],
-        },
-        {
-            "agent_id": "heal-agent-001",
-            "agent_type": AgentType.HEAL.value,
-            "name": "Heal Agent",
-            "description": "Playbook驱动的故障自愈引擎，支持L0-L2三级自愈+熔断控制",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["Playbook匹配", "Dry-Run模拟", "爆炸半径评估", "熔断保护", "回滚计划"],
-        },
-        {
-            "agent_id": "change-agent-001",
-            "agent_type": AgentType.CHANGE.value,
-            "name": "Change Agent",
-            "description": "多维风险评分+多级审批流程的变更管理Agent",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["五因素风险评分", "多级审批", "审计日志", "升级机制"],
-        },
-        {
-            "agent_id": "memory-agent-001",
-            "agent_type": AgentType.MEMORY.value,
-            "name": "Memory Agent",
-            "description": "三层记忆系统（短期/长期/工作记忆），支持语义搜索和时间衰减",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["语义搜索", "RRF融合排序", "时间衰减", "记忆合并", "自动归档"],
-        },
-        {
-            "agent_id": "eval-agent-001",
-            "agent_type": AgentType.EVAL.value,
-            "name": "Eval Agent",
-            "description": "四维度（端到端/推理/工具调用/RAG）评估框架",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["端到端评估", "推理评估", "工具调用评估", "RAG评估", "基准报告"],
-        },
-        {
-            "agent_id": "orchestrator-001",
-            "agent_type": AgentType.ORCHESTRATOR.value,
-            "name": "Orchestrator",
-            "description": "LangGraph多Agent编排器，管理完整故障处理状态机",
-            "status": AgentStatus.IDLE.value,
-            "version": "1.0.0",
-            "capabilities": ["状态机编排", "条件路由", "并行执行", "WebSocket推送"],
-        },
+        _agent_public_info(agent_id, meta)
+        for agent_id, meta in _AGENT_REGISTRY.items()
     ]
+
+    # orchestrator 状态由 lifespan 探针推导:LangGraph 图构建失败时报 offline
+    langgraph_available = getattr(request.app.state, "langgraph_available", None)
+    if langgraph_available is False:
+        for a in agents:
+            if a["agent_id"] == "orchestrator-001":
+                a["status"] = AgentStatus.OFFLINE.value
 
     if agent_type:
         agents = [a for a in agents if a["agent_type"] == agent_type.value]
@@ -1105,31 +1149,35 @@ async def list_agents(
 async def get_agent_status(
     agent_id: str,
 ) -> dict[str, Any]:
-    """获取 Agent 详细状态"""
+    """获取 Agent 详细状态（真实执行统计;未知 id 返回零值兜底）"""
     logger.info("Get agent status", agent_id=agent_id)
 
-    # 查找对应 agent
-    agents_map = {
-        "monitor-agent-001": {"total_executions": 1250, "success_rate": 0.982},
-        "rca-agent-001": {"total_executions": 890, "success_rate": 0.945},
-        "heal-agent-001": {"total_executions": 560, "success_rate": 0.912},
-        "change-agent-001": {"total_executions": 320, "success_rate": 0.978},
-        "memory-agent-001": {"total_executions": 2100, "success_rate": 0.995},
-        "eval-agent-001": {"total_executions": 180, "success_rate": 0.967},
-        "orchestrator-001": {"total_executions": 430, "success_rate": 0.988},
-    }
-
-    info = agents_map.get(agent_id, {"total_executions": 0, "success_rate": 0.0})
-
-    return {
+    meta = _AGENT_REGISTRY.get(agent_id)
+    response: dict[str, Any] = {
         "agent_id": agent_id,
         "status": AgentStatus.IDLE.value,
         "current_task": "",
         "progress_percent": 0,
-        "total_executions": info["total_executions"],
-        "success_rate": info["success_rate"],
-        "capabilities": ["anomaly_detection", "root_cause_analysis", "healing", "evaluation"],
+        "total_executions": 0,
+        "success_rate": 0.0,
+        "capabilities": meta["capabilities"] if meta else [],
     }
+    if meta is None:
+        return response
+
+    instance = meta["peek"]()
+    if instance is not None:
+        state = instance.state
+        response.update(
+            {
+                "status": state.status.value,
+                "current_task": state.current_task,
+                "progress_percent": state.progress_percent,
+                "total_executions": state.total_executions,
+                "success_rate": round(state.success_rate, 4),
+            }
+        )
+    return response
 
 
 # =============================================================================
