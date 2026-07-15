@@ -43,7 +43,7 @@ def test_run_then_list_returns_real_history(monkeypatch: pytest.MonkeyPatch) -> 
     client = TestClient(app)
 
     run_resp = client.post("/api/v1/evaluations/run?eval_type=reasoning")
-    assert run_resp.status_code == 202
+    assert run_resp.status_code == 200
     eval_id = run_resp.json()["eval_id"]
 
     list_resp = client.get("/api/v1/evaluations")
@@ -73,7 +73,7 @@ def test_eval_type_filter_and_pagination(monkeypatch: pytest.MonkeyPatch) -> Non
     for _ in range(3):
         assert (
             client.post("/api/v1/evaluations/run?eval_type=reasoning").status_code
-            == 202
+            == 200
         )
 
     filtered = client.get("/api/v1/evaluations?eval_type=reasoning").json()

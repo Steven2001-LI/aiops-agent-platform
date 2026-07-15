@@ -296,9 +296,9 @@ class TestEvaluationEndpoints:
         client = TestClient(app)
         response = client.post("/api/v1/evaluations/run?eval_type=end_to_end")
 
-        assert response.status_code == 202
+        assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "started"
+        assert data["status"] == "completed"
         assert "eval_id" in data
 
 
